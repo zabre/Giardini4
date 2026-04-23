@@ -437,18 +437,19 @@ def main():
         st.markdown(f'<div style="font-family: Doto, sans-serif; font-size: 48px; line-height: 1;">{len(filtered_df)}</div>', unsafe_allow_html=True)
         st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
 
-        # --- NOUVEAU GRAPHIQUE BAR CHART ---
+        # --- NOUVEAU GRAPHIQUE COURBE (LINE CHART) ---
         if len(filtered_df) > 0 and len(search_terms) > 0:
             st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
             
-            # Agrégation des mentions par date (utilisation de DateLabel pour que l'axe X soit joli (ex: 23/04/2026))
-            chart_data = filtered_df.groupby('DateLabel').size().reset_index(name='Mentions')
+            # Agrégation des mentions par date (format YYYY-MM-DD pour que la courbe temporelle soit dans le bon ordre)
+            chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
             
-            # Convertir l'index pour Streamlit (l'index devient l'axe X du graphique)
-            chart_data = chart_data.set_index('DateLabel')
+            # Formater la date en datetime pour un rendu de courbe parfait sur l'axe X
+            chart_data['DateSortKey'] = pd.to_datetime(chart_data['DateSortKey'])
+            chart_data = chart_data.set_index('DateSortKey')
             
-            # Affichage du bar chart
-            st.bar_chart(data=chart_data, y="Mentions", color="#D71921", height=250)
+            # Affichage de la courbe, fond transparent par défaut dans Streamlit
+            st.line_chart(data=chart_data, y="Mentions", color="#D71921", height=250)
 
         if search_terms and len(selected_indices) > 0:
             st.markdown('<div class="tertiary-text">[ EXPORT SÉLECTIF ]</div><br>', unsafe_allow_html=True)
