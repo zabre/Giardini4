@@ -262,7 +262,7 @@ def parse_selected_dates_us(dummy, selected_dates_info):
     data = []
     
     for sort_key, info in selected_dates_info.items():
-        date_label = info['label'].split(" ")[0] # Keep only the date part for display
+        date_label = info['label'].split(" ")[0]
         for file_id in info['files']:
             vol, num = file_id.split('/')
             art_url = f"https://api.congress.gov/v3/daily-congressional-record/{vol}/{num}/articles"
@@ -294,7 +294,6 @@ def parse_selected_dates_us(dummy, selected_dates_info):
                                 
                                 if not verbatim: continue
                                 
-                                # Extraction de l'orateur (Pattern typique US : "  Mr. SMITH. Mr. Speaker...")
                                 nom_orateur = "CONGRESS MEMBER"
                                 speaker_match = re.search(r'^\s*(?:Mr\.|Ms\.|Mrs\.|The\s[A-Z\s]+)\s+([A-Za-z\s\.\'-]+)\.', verbatim)
                                 if speaker_match:
@@ -404,7 +403,7 @@ def main():
         st.stop()
 
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE ]</div>', unsafe_allow_html=True)
-    acteurs_input = st.sidebar.text_input("ACTEURS", placeholder="EX: MACRON, MICHEL, BIDEN")
+    acteurs_input = st.sidebar.text_input("ACTEURS", placeholder="EX: MACRON, BIDEN, SCHUMER")
     mots_input = st.sidebar.text_input("MOTS-CLÉS", placeholder="EX: NUCLÉAIRE, TAXONOMIE, TAX")
 
     # --- PARSING ---
@@ -437,7 +436,20 @@ def main():
         st.markdown('<div class="tertiary-text">MÉTRIQUES</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="font-family: Doto, sans-serif; font-size: 48px; line-height: 1;">{len(filtered_df)}</div>', unsafe_allow_html=True)
         st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
-        
+
+        # --- NOUVEAU GRAPHIQUE BAR CHART ---
+        if not filtered_df.empty and search_terms:
+            st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
+            
+            # Agrégation des mentions par date.
+            # On regroupe par DateSortKey pour garantir l'ordre chronologique des barres
+            chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
+            # On met la date en index pour que Streamlit l'utilise sur l'axe X
+            chart_data = chart_data.set_index('DateSortKey')
+            
+            # Affichage du graphique de base de Streamlit avec la couleur rouge de l'interface
+            st.bar_chart(chart_data, color="#D71921", height=200)
+
         if search_terms and len(selected_indices) > 0:
             st.markdown('<div class="tertiary-text">[ EXPORT SÉLECTIF ]</div><br>', unsafe_allow_html=True)
             df_to_export = filtered_df.loc[selected_indices]
