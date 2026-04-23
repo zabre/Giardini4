@@ -438,17 +438,17 @@ def main():
         st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
 
         # --- NOUVEAU GRAPHIQUE BAR CHART ---
-        if not filtered_df.empty and search_terms:
+        if len(filtered_df) > 0 and len(search_terms) > 0:
             st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
             
-            # Agrégation des mentions par date.
-            # On regroupe par DateSortKey pour garantir l'ordre chronologique des barres
-            chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
-            # On met la date en index pour que Streamlit l'utilise sur l'axe X
-            chart_data = chart_data.set_index('DateSortKey')
+            # Agrégation des mentions par date (utilisation de DateLabel pour que l'axe X soit joli (ex: 23/04/2026))
+            chart_data = filtered_df.groupby('DateLabel').size().reset_index(name='Mentions')
             
-            # Affichage du graphique de base de Streamlit avec la couleur rouge de l'interface
-            st.bar_chart(chart_data, color="#D71921", height=200)
+            # Convertir l'index pour Streamlit (l'index devient l'axe X du graphique)
+            chart_data = chart_data.set_index('DateLabel')
+            
+            # Affichage du bar chart
+            st.bar_chart(data=chart_data, y="Mentions", color="#D71921", height=250)
 
         if search_terms and len(selected_indices) > 0:
             st.markdown('<div class="tertiary-text">[ EXPORT SÉLECTIF ]</div><br>', unsafe_allow_html=True)
