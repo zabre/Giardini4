@@ -364,7 +364,7 @@ def main():
     inject_custom_css(st.session_state.ui_theme)
 
     st.markdown('<div class="hero-title">GIARDINI</div>', unsafe_allow_html=True)
-    st.markdown('<span class="hero-subtitle">Veille des débats parlementaires en France, dans l'UE et aux US</span>', unsafe_allow_html=True)
+    st.markdown('<span class="hero-subtitle">Veille des débats parlementaires en France, en UE et aux US</span>', unsafe_allow_html=True)
 
     # --- SIDEBAR ---
     st.sidebar.markdown('<div class="tertiary-text red-accent">[ PARAMÈTRES UI ]</div>', unsafe_allow_html=True)
