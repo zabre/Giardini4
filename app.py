@@ -95,10 +95,10 @@ class BooleanQueryError(Exception):
     pass
 
 # --- Tokenizer ---
-TOKEN_AND   = 'AND'
-TOKEN_OR    = 'OR'
-TOKEN_NOT   = 'NOT'
-TOKEN_MINUS = 'MINUS'
+TOKEN_AND    = 'AND'
+TOKEN_OR     = 'OR'
+TOKEN_NOT    = 'NOT'
+TOKEN_MINUS  = 'MINUS'
 TOKEN_LPAREN = 'LPAREN'
 TOKEN_RPAREN = 'RPAREN'
 TOKEN_PHRASE = 'PHRASE'
@@ -262,7 +262,7 @@ def boolean_search_and_highlight(df: pd.DataFrame, query: str):
         empty = df.copy()
         empty['VerbatimHighlight'] = empty['Verbatim']
         empty['MotsTrouves'] = ''
-        return empty.iloc[0:0], [], None  # Aucun résultat si requête vide
+        return empty.iloc[0:0], [], None
 
     try:
         ast = build_ast(query)
@@ -272,12 +272,10 @@ def boolean_search_and_highlight(df: pd.DataFrame, query: str):
         empty['MotsTrouves'] = ''
         return empty.iloc[0:0], [], str(e)
 
-    # Filtrage
     mask = df['Verbatim'].apply(lambda x: evaluate_ast(ast, str(x)))
     filtered = df[mask].copy()
 
-    # Termes positifs pour le surlignage
-    positive_terms = list(dict.fromkeys(collect_positive_terms(ast)))  # dédupliqués, ordonnés
+    positive_terms = list(dict.fromkeys(collect_positive_terms(ast)))
 
     if positive_terms:
         pattern = '|'.join(re.escape(t) for t in positive_terms)
@@ -446,7 +444,6 @@ def fetch_and_index_us():
         issues = response.json().get("dailyCongressionalRecord", [])
     except Exception:
         return None, None
-
     catalog = {}
     for issue in issues:
         date_raw = issue.get("issueDate", "")[:10]
@@ -520,16 +517,13 @@ def generate_html_export(df, theme, institution, query=""):
     text_color = "#1A1A1A" if theme == "LIGHT" else "#FFFFFF"
     border_color = "#D2D2D2" if theme == "LIGHT" else "#333333"
     dates_header = ", ".join(df['DateLabel'].unique())
-
     if "UE" in institution:
         source_label = "PARLEMENT EUROPÉEN"
     elif "US" in institution:
         source_label = "CONGRÈS AMÉRICAIN"
     else:
         source_label = "ASSEMBLÉE NATIONALE"
-
     query_label = f" // REQUÊTE: {query.upper()}" if query else ""
-
     html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&family=Space+Mono&display=swap');
@@ -543,7 +537,6 @@ def generate_html_export(df, theme, institution, query=""):
     .reactions {{ font-family: 'Space Mono', monospace; color: #888; font-size: 10px; margin-top: 20px; }}
     </style></head><body>
     <h1>GIARDINI EXPORT // {source_label} // {dates_header}{query_label} // {len(df)} MENTIONS</h1>"""
-
     for _, row in df.iterrows():
         html += f"""<div class="item">
             <div class="orateur">{row['NomOrateur']} [{row['Qualite']}]</div>
@@ -606,20 +599,22 @@ def main():
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE BOOLÉEN ]</div>', unsafe_allow_html=True)
     bool_query = st.sidebar.text_input(
         "REQUÊTE",
-        placeholder="EX: MACRON AND (NUCLÉAIRE OR ÉNERGIE) NOT GUERRE"
+        placeholder="EX: MACRON AND (NUCL\u00c9AIRE OR \u00c9NERGIE) NOT GUERRE"
     )
-    st.sidebar.markdown(
+    # Note : apostrophes dans le HTML escapées en entités HTML (&#39;) pour éviter
+    # de fermer prématurément les guillemets simples Python.
+    bool_help_html = (
         '<div class="bool-help">'
-        'Opérateurs supportés :<br>'
-        '· <b>AND</b> &nbsp;— les deux termes<br>'
-        '· <b>OR</b> &nbsp;&nbsp;— l'un ou l'autre<br>'
-        '· <b>NOT</b> ou <b>-</b> — exclure<br>'
-        '· <b>(  )</b> &nbsp;— groupement<br>'
-        '· <b>"phrase"</b> — expression exacte<br>'
-        '· Sans opérateur : AND implicite'
-        '</div>',
-        unsafe_allow_html=True
+        'Op&eacute;rateurs support&eacute;s :<br>'
+        '&middot; <b>AND</b> &nbsp;&mdash; les deux termes<br>'
+        '&middot; <b>OR</b> &nbsp;&nbsp;&mdash; l&#39;un ou l&#39;autre<br>'
+        '&middot; <b>NOT</b> ou <b>-</b> &mdash; exclure un terme<br>'
+        '&middot; <b>(  )</b> &nbsp;&mdash; groupement<br>'
+        '&middot; <b>&quot;phrase&quot;</b> &mdash; expression exacte<br>'
+        '&middot; Sans op&eacute;rateur : AND implicite'
+        '</div>'
     )
+    st.sidebar.markdown(bool_help_html, unsafe_allow_html=True)
 
     # --- PARSING ---
     selected_dates_info = {k: catalog[k] for k in selected_date_keys}
@@ -641,7 +636,10 @@ def main():
     filtered_df, search_terms, bool_error = boolean_search_and_highlight(df, bool_query)
 
     if bool_error:
-        st.sidebar.markdown(f'<div class="bool-error">⚠ ERREUR SYNTAXE: {bool_error}</div>', unsafe_allow_html=True)
+        st.sidebar.markdown(
+            f'<div class="bool-error">⚠ ERREUR SYNTAXE: {bool_error}</div>',
+            unsafe_allow_html=True
+        )
 
     selected_indices = [
         idx for idx in filtered_df.index
@@ -656,7 +654,6 @@ def main():
         st.markdown(f'<div style="font-family: Doto, sans-serif; font-size: 48px; line-height: 1;">{len(filtered_df)}</div>', unsafe_allow_html=True)
         st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
 
-        # --- GRAPHIQUE COURBE ---
         if len(filtered_df) > 0 and len(search_terms) > 0:
             st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
             chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
@@ -681,15 +678,12 @@ def main():
             st.markdown('<div class="tertiary-text red-accent">NULL: AUCUNE CORRESPONDANCE TROUVÉE.</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="tertiary-text">RÉSULTATS (Cochez pour exporter)</div><br>', unsafe_allow_html=True)
-
             for idx, row in filtered_df.iterrows():
                 expander_title = f"{row['DateLabel']} | {row['NomOrateur']} ({row['Qualite']}) | {str(row['Sequence'])[:40]}..."
-
                 with st.expander(expander_title, expanded=False):
                     chk_key = f"chk_{row['DateSortKey']}_{idx}"
                     st.checkbox("INCLURE DANS L'EXPORT", key=chk_key)
                     st.markdown("---")
-
                     st.markdown(f"""
                         <div class="tertiary-text" style="line-height: 1.8;">
                         DATE &nbsp;&nbsp;&nbsp;&nbsp;: {row['DateLabel']} (SÉANCE : {row['Moment']})<br>
@@ -699,7 +693,6 @@ def main():
                         DÉTECTION: <span class="red-accent">{row['MotsTrouves'].upper()}</span>
                         </div><br>
                     """, unsafe_allow_html=True)
-
                     st.markdown(f'<div style="line-height: 1.6; text-align: justify;">{row["VerbatimHighlight"]}</div>', unsafe_allow_html=True)
                     if row['Reactions']:
                         st.markdown(f'<br><div class="tertiary-text">RX: {row["Reactions"]}</div>', unsafe_allow_html=True)
