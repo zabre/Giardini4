@@ -36,6 +36,8 @@ def inject_custom_css(theme):
     .hero-subtitle {{ font-family: 'Space Mono', monospace; font-size: 14px; color: var(--accent); text-transform: uppercase; letter-spacing: 4px; margin-bottom: 40px; display: block; }}
     .tertiary-text {{ font-family: 'Space Mono', monospace; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }}
     .red-accent {{ color: var(--accent) !important; }}
+    .bool-help {{ font-family: 'Space Mono', monospace; font-size: 10px; color: var(--muted); line-height: 1.6; padding: 8px; border-left: 2px solid var(--accent); margin-top: 6px; }}
+    .bool-error {{ font-family: 'Space Mono', monospace; font-size: 10px; color: var(--accent); padding: 6px 8px; border: 1px solid var(--accent); margin-top: 6px; }}
     div[data-testid="stExpander"] {{ background-color: var(--bg) !important; border: 1px solid var(--border) !important; border-radius: 0px !important; box-shadow: none !important; margin-bottom: 10px; }}
     div[data-testid="stExpander"] summary {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; color: var(--text) !important; }}
     div.stTextInput > div > div > input, div[data-baseweb="select"] > div {{ border-radius: 4px !important; border: 1px solid var(--border) !important; background-color: var(--bg-sec) !important; font-family: 'Space Mono', monospace !important; font-size: 13px !important; color: var(--text) !important; }}
@@ -64,25 +66,231 @@ def parse_french_date_to_sortable(datestr):
         return f"{match.group(3)}-{months.get(match.group(2), '00')}-{match.group(1).zfill(2)}"
     return "0000-00-00"
 
-def search_and_highlight(df, acteurs, motscles):
-    all_terms = [t.strip() for t in acteurs.split(',') + motscles.split(',') if t.strip()]
-    if not all_terms:
-        return df, []
-    pattern = '|'.join(re.escape(t) for t in all_terms)
-    regex = re.compile(f"({pattern})", flags=re.IGNORECASE)
-    mask = df['Verbatim'].str.contains(pattern, case=False, na=False, regex=True)
-    filtered_df = df[mask].copy()
-    filtered_df['VerbatimHighlight'] = filtered_df['Verbatim'].apply(
-        lambda x: regex.sub(r'<mark class="industrial-highlight">\1</mark>', str(x)))
-    filtered_df['MotsTrouves'] = filtered_df['Verbatim'].apply(
-        lambda x: ", ".join(list(set(m.lower() for m in regex.findall(str(x))))))
-    return filtered_df, all_terms
-
 def get_secret_key(secret_name, default_val):
     try:
         return st.secrets[secret_name]
     except (FileNotFoundError, KeyError):
         return default_val
+
+# ==========================================
+# MOTEUR DE RECHERCHE BOOLÉEN
+# ==========================================
+#
+# Syntaxe supportée :
+#   MACRON AND NUCLÉAIRE
+#   MACRON OR LE PEN
+#   NUCLÉAIRE NOT GUERRE    (ou NUCLÉAIRE -GUERRE)
+#   (NUCLÉAIRE OR ÉNERGIE) AND MACRON
+#   "énergie nucléaire"     (phrase exacte)
+#   MACRON NUCLÉAIRE        (AND implicite par défaut)
+#
+# Grammaire (priorité croissante) :
+#   expr    := or_expr
+#   or_expr := and_expr (OR and_expr)*
+#   and_expr:= not_expr (AND? not_expr)*   <- AND implicite
+#   not_expr:= NOT primary | -primary | primary
+#   primary := TERM | PHRASE | LPAREN expr RPAREN
+
+class BooleanQueryError(Exception):
+    pass
+
+# --- Tokenizer ---
+TOKEN_AND   = 'AND'
+TOKEN_OR    = 'OR'
+TOKEN_NOT   = 'NOT'
+TOKEN_MINUS = 'MINUS'
+TOKEN_LPAREN = 'LPAREN'
+TOKEN_RPAREN = 'RPAREN'
+TOKEN_PHRASE = 'PHRASE'
+TOKEN_TERM   = 'TERM'
+TOKEN_EOF    = 'EOF'
+
+def tokenize(query: str):
+    """Retourne une liste de (type, valeur)."""
+    tokens = []
+    i = 0
+    q = query.strip()
+    while i < len(q):
+        if q[i].isspace():
+            i += 1
+            continue
+        if q[i] == '"':
+            j = q.find('"', i + 1)
+            if j == -1:
+                raise BooleanQueryError('Guillemet fermant manquant.')
+            tokens.append((TOKEN_PHRASE, q[i+1:j]))
+            i = j + 1
+            continue
+        if q[i] == '(':
+            tokens.append((TOKEN_LPAREN, '('))
+            i += 1
+            continue
+        if q[i] == ')':
+            tokens.append((TOKEN_RPAREN, ')'))
+            i += 1
+            continue
+        if q[i] == '-' and (i == 0 or q[i-1].isspace() or q[i-1] == '('):
+            tokens.append((TOKEN_MINUS, '-'))
+            i += 1
+            continue
+        # Lire un mot
+        j = i
+        while j < len(q) and not q[j].isspace() and q[j] not in '()"':
+            j += 1
+        word = q[i:j]
+        upper = word.upper()
+        if upper == 'AND':
+            tokens.append((TOKEN_AND, 'AND'))
+        elif upper == 'OR':
+            tokens.append((TOKEN_OR, 'OR'))
+        elif upper == 'NOT':
+            tokens.append((TOKEN_NOT, 'NOT'))
+        else:
+            tokens.append((TOKEN_TERM, word))
+        i = j
+    tokens.append((TOKEN_EOF, ''))
+    return tokens
+
+# --- Parser récursif descendant ---
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self):
+        return self.tokens[self.pos][0]
+
+    def consume(self, expected=None):
+        tok = self.tokens[self.pos]
+        if expected and tok[0] != expected:
+            raise BooleanQueryError(f"Attendu '{expected}', trouvé '{tok[1]}'")
+        self.pos += 1
+        return tok
+
+    def parse(self):
+        node = self.parse_or()
+        if self.peek() != TOKEN_EOF:
+            raise BooleanQueryError("Requête mal formée : token inattendu.")
+        return node
+
+    def parse_or(self):
+        left = self.parse_and()
+        while self.peek() == TOKEN_OR:
+            self.consume(TOKEN_OR)
+            right = self.parse_and()
+            left = ('OR', left, right)
+        return left
+
+    def parse_and(self):
+        left = self.parse_not()
+        while self.peek() not in (TOKEN_OR, TOKEN_RPAREN, TOKEN_EOF):
+            explicit_and = self.peek() == TOKEN_AND
+            if explicit_and:
+                self.consume(TOKEN_AND)
+            right = self.parse_not()
+            left = ('AND', left, right)
+        return left
+
+    def parse_not(self):
+        if self.peek() in (TOKEN_NOT, TOKEN_MINUS):
+            self.consume()
+            operand = self.parse_primary()
+            return ('NOT', operand)
+        return self.parse_primary()
+
+    def parse_primary(self):
+        tok_type, tok_val = self.tokens[self.pos]
+        if tok_type == TOKEN_TERM:
+            self.consume()
+            return ('TERM', tok_val)
+        if tok_type == TOKEN_PHRASE:
+            self.consume()
+            return ('PHRASE', tok_val)
+        if tok_type == TOKEN_LPAREN:
+            self.consume(TOKEN_LPAREN)
+            node = self.parse_or()
+            self.consume(TOKEN_RPAREN)
+            return node
+        raise BooleanQueryError(f"Token inattendu : '{tok_val}'")
+
+def build_ast(query: str):
+    """Retourne l'AST ou lève BooleanQueryError."""
+    if not query.strip():
+        return None
+    tokens = tokenize(query)
+    parser = Parser(tokens)
+    return parser.parse()
+
+def evaluate_ast(node, text: str) -> bool:
+    """Évalue le nœud AST sur une chaîne de texte."""
+    if node is None:
+        return True
+    kind = node[0]
+    if kind == 'TERM':
+        return bool(re.search(re.escape(node[1]), text, re.IGNORECASE))
+    if kind == 'PHRASE':
+        return bool(re.search(re.escape(node[1]), text, re.IGNORECASE))
+    if kind == 'AND':
+        return evaluate_ast(node[1], text) and evaluate_ast(node[2], text)
+    if kind == 'OR':
+        return evaluate_ast(node[1], text) or evaluate_ast(node[2], text)
+    if kind == 'NOT':
+        return not evaluate_ast(node[1], text)
+    return False
+
+def collect_positive_terms(node) -> list:
+    """Collecte tous les termes positifs (non niés) pour le surlignage."""
+    if node is None:
+        return []
+    kind = node[0]
+    if kind in ('TERM', 'PHRASE'):
+        return [node[1]]
+    if kind == 'AND':
+        return collect_positive_terms(node[1]) + collect_positive_terms(node[2])
+    if kind == 'OR':
+        return collect_positive_terms(node[1]) + collect_positive_terms(node[2])
+    if kind == 'NOT':
+        return []  # Ne pas surligner les termes exclus
+    return []
+
+def boolean_search_and_highlight(df: pd.DataFrame, query: str):
+    """
+    Filtre df selon la requête booléenne et ajoute la colonne VerbatimHighlight.
+    Retourne (filtered_df, positive_terms, error_message).
+    """
+    if not query.strip():
+        empty = df.copy()
+        empty['VerbatimHighlight'] = empty['Verbatim']
+        empty['MotsTrouves'] = ''
+        return empty.iloc[0:0], [], None  # Aucun résultat si requête vide
+
+    try:
+        ast = build_ast(query)
+    except BooleanQueryError as e:
+        empty = df.copy()
+        empty['VerbatimHighlight'] = empty['Verbatim']
+        empty['MotsTrouves'] = ''
+        return empty.iloc[0:0], [], str(e)
+
+    # Filtrage
+    mask = df['Verbatim'].apply(lambda x: evaluate_ast(ast, str(x)))
+    filtered = df[mask].copy()
+
+    # Termes positifs pour le surlignage
+    positive_terms = list(dict.fromkeys(collect_positive_terms(ast)))  # dédupliqués, ordonnés
+
+    if positive_terms:
+        pattern = '|'.join(re.escape(t) for t in positive_terms)
+        regex = re.compile(f"({pattern})", flags=re.IGNORECASE)
+        filtered['VerbatimHighlight'] = filtered['Verbatim'].apply(
+            lambda x: regex.sub(r'<mark class="industrial-highlight">\1</mark>', str(x)))
+        filtered['MotsTrouves'] = filtered['Verbatim'].apply(
+            lambda x: ", ".join(list(dict.fromkeys(m.lower() for m in regex.findall(str(x))))))
+    else:
+        filtered['VerbatimHighlight'] = filtered['Verbatim']
+        filtered['MotsTrouves'] = ''
+
+    return filtered, positive_terms, None
 
 # ==========================================
 # MOTEUR 1 : ASSEMBLÉE NATIONALE (FRANCE)
@@ -171,7 +379,7 @@ def fetch_and_index_eu():
         return None, None
     catalog = {}
     for doc in data:
-        doc_id = doc.get("identifier", "") 
+        doc_id = doc.get("identifier", "")
         if not doc_id or not doc_id.startswith("CRE-"): continue
         parts = doc_id.split("-")
         if len(parts) >= 5:
@@ -245,22 +453,18 @@ def fetch_and_index_us():
         if not date_raw: continue
         vol = str(issue.get("volumeNumber", ""))
         num = str(issue.get("issueNumber", ""))
-        
         parts = date_raw.split("-")
         date_label = f"{parts[2]}/{parts[1]}/{parts[0]}" if len(parts) == 3 else date_raw
-        
         if date_raw not in catalog:
             catalog[date_raw] = {"label": f"{date_label} (Vol.{vol} No.{num})", "files": [f"{vol}/{num}"]}
         else:
             catalog[date_raw]["files"].append(f"{vol}/{num}")
-            
     return b"us_placeholder", dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
 
 @st.cache_data(show_spinner=False)
 def parse_selected_dates_us(dummy, selected_dates_info):
     api_key = get_secret_key("CONGRESS_API_KEY", "DEMO_KEY")
     data = []
-    
     for sort_key, info in selected_dates_info.items():
         date_label = info['label'].split(" ")[0]
         for file_id in info['files']:
@@ -272,7 +476,6 @@ def parse_selected_dates_us(dummy, selected_dates_info):
                 articles = resp.json().get('articles', [])
             except Exception:
                 continue
-                
             for section in articles:
                 chamber = section.get('name', 'SECTION UNKNOWN')
                 for article in section.get('sectionArticles', []):
@@ -282,23 +485,18 @@ def parse_selected_dates_us(dummy, selected_dates_info):
                             try:
                                 htm_resp = requests.get(text_item['url'], timeout=30)
                                 if htm_resp.status_code != 200: continue
-                                
                                 soup = BeautifulSoup(htm_resp.content, 'html.parser')
                                 paras = soup.find_all('p')
-                                
                                 if paras:
                                     verbatim = " \n".join([p.get_text().strip() for p in paras if p.get_text().strip()])
                                 else:
                                     pre = soup.find('pre')
                                     verbatim = pre.get_text().strip() if pre else soup.get_text().strip()
-                                
                                 if not verbatim: continue
-                                
                                 nom_orateur = "CONGRESS MEMBER"
                                 speaker_match = re.search(r'^\s*(?:Mr\.|Ms\.|Mrs\.|The\s[A-Z\s]+)\s+([A-Za-z\s\.\'-]+)\.', verbatim)
                                 if speaker_match:
                                     nom_orateur = speaker_match.group(0).strip(' .')
-                                    
                                 data.append({
                                     "DateSortKey": sort_key,
                                     "DateLabel": date_label,
@@ -317,19 +515,21 @@ def parse_selected_dates_us(dummy, selected_dates_info):
 # ==========================================
 # EXPORT HTML
 # ==========================================
-def generate_html_export(df, theme, institution):
+def generate_html_export(df, theme, institution, query=""):
     bg_color = "#F4F4F0" if theme == "LIGHT" else "#000000"
     text_color = "#1A1A1A" if theme == "LIGHT" else "#FFFFFF"
     border_color = "#D2D2D2" if theme == "LIGHT" else "#333333"
     dates_header = ", ".join(df['DateLabel'].unique())
-    
+
     if "UE" in institution:
         source_label = "PARLEMENT EUROPÉEN"
     elif "US" in institution:
         source_label = "CONGRÈS AMÉRICAIN"
     else:
         source_label = "ASSEMBLÉE NATIONALE"
-        
+
+    query_label = f" // REQUÊTE: {query.upper()}" if query else ""
+
     html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&family=Space+Mono&display=swap');
@@ -342,8 +542,8 @@ def generate_html_export(df, theme, institution):
     mark {{ background: transparent; color: #D71921; border-bottom: 2px solid #D71921; font-weight: bold; padding: 0 2px; }}
     .reactions {{ font-family: 'Space Mono', monospace; color: #888; font-size: 10px; margin-top: 20px; }}
     </style></head><body>
-    <h1>GIARDINI EXPORT // {source_label} // {dates_header} // {len(df)} MENTIONS</h1>"""
-    
+    <h1>GIARDINI EXPORT // {source_label} // {dates_header}{query_label} // {len(df)} MENTIONS</h1>"""
+
     for _, row in df.iterrows():
         html += f"""<div class="item">
             <div class="orateur">{row['NomOrateur']} [{row['Qualite']}]</div>
@@ -397,14 +597,29 @@ def main():
         default=[list(catalog.keys())[0]] if catalog else [],
         format_func=lambda x: catalog[x]['label'].upper()
     )
-    
+
     if not selected_date_keys:
         st.markdown('<div class="tertiary-text red-accent">SYS.HALT: VEUILLEZ SÉLECTIONNER AU MOINS UNE DATE.</div>', unsafe_allow_html=True)
         st.stop()
 
-    st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE ]</div>', unsafe_allow_html=True)
-    acteurs_input = st.sidebar.text_input("ACTEURS", placeholder="EX: MACRON, BIDEN, SCHUMER")
-    mots_input = st.sidebar.text_input("MOTS-CLÉS", placeholder="EX: NUCLÉAIRE, TAXONOMIE, TAX")
+    # --- MOTEUR DE RECHERCHE BOOLÉEN ---
+    st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE BOOLÉEN ]</div>', unsafe_allow_html=True)
+    bool_query = st.sidebar.text_input(
+        "REQUÊTE",
+        placeholder="EX: MACRON AND (NUCLÉAIRE OR ÉNERGIE) NOT GUERRE"
+    )
+    st.sidebar.markdown(
+        '<div class="bool-help">'
+        'Opérateurs supportés :<br>'
+        '· <b>AND</b> &nbsp;— les deux termes<br>'
+        '· <b>OR</b> &nbsp;&nbsp;— l'un ou l'autre<br>'
+        '· <b>NOT</b> ou <b>-</b> — exclure<br>'
+        '· <b>(  )</b> &nbsp;— groupement<br>'
+        '· <b>"phrase"</b> — expression exacte<br>'
+        '· Sans opérateur : AND implicite'
+        '</div>',
+        unsafe_allow_html=True
+    )
 
     # --- PARSING ---
     selected_dates_info = {k: catalog[k] for k in selected_date_keys}
@@ -422,8 +637,12 @@ def main():
         st.markdown('<div class="tertiary-text red-accent">NULL: AUCUNE DONNÉE DISPONIBLE POUR CETTE SÉLECTION.</div>', unsafe_allow_html=True)
         st.stop()
 
-    # --- RECHERCHE ---
-    filtered_df, search_terms = search_and_highlight(df, acteurs_input, mots_input)
+    # --- RECHERCHE BOOLÉENNE ---
+    filtered_df, search_terms, bool_error = boolean_search_and_highlight(df, bool_query)
+
+    if bool_error:
+        st.sidebar.markdown(f'<div class="bool-error">⚠ ERREUR SYNTAXE: {bool_error}</div>', unsafe_allow_html=True)
+
     selected_indices = [
         idx for idx in filtered_df.index
         if st.session_state.get(f"chk_{filtered_df.loc[idx, 'DateSortKey']}_{idx}", False)
@@ -437,44 +656,40 @@ def main():
         st.markdown(f'<div style="font-family: Doto, sans-serif; font-size: 48px; line-height: 1;">{len(filtered_df)}</div>', unsafe_allow_html=True)
         st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
 
-        # --- NOUVEAU GRAPHIQUE COURBE (LINE CHART) ---
+        # --- GRAPHIQUE COURBE ---
         if len(filtered_df) > 0 and len(search_terms) > 0:
             st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
-            
-            # Agrégation des mentions par date (format YYYY-MM-DD pour que la courbe temporelle soit dans le bon ordre)
             chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
-            
-            # Formater la date en datetime pour un rendu de courbe parfait sur l'axe X
             chart_data['DateSortKey'] = pd.to_datetime(chart_data['DateSortKey'])
             chart_data = chart_data.set_index('DateSortKey')
-            
-            # Affichage de la courbe, fond transparent par défaut dans Streamlit
             st.line_chart(data=chart_data, y="Mentions", color="#D71921", height=250)
 
         if search_terms and len(selected_indices) > 0:
             st.markdown('<div class="tertiary-text">[ EXPORT SÉLECTIF ]</div><br>', unsafe_allow_html=True)
             df_to_export = filtered_df.loc[selected_indices]
-            html_export = generate_html_export(df_to_export, st.session_state.ui_theme, institution)
+            html_export = generate_html_export(df_to_export, st.session_state.ui_theme, institution, bool_query)
             suffix = "US" if "US" in institution else ("UE" if "UE" in institution else "FR")
             filename = f"giardini_export_{suffix}_{len(selected_date_keys)}DATES.html"
             st.download_button("EXPORTER SÉLECTION (HTML)", data=html_export, file_name=filename, mime="text/html", type="primary")
 
     with col_data:
-        if not search_terms:
+        if not bool_query.strip():
             st.markdown('<div class="tertiary-text">WAITING FOR INPUT: VEUILLEZ SAISIR UNE REQUÊTE DANS LE PANNEAU DE CONTRÔLE.</div>', unsafe_allow_html=True)
+        elif bool_error:
+            st.markdown(f'<div class="tertiary-text red-accent">ERREUR DE SYNTAXE: {bool_error}</div>', unsafe_allow_html=True)
         elif filtered_df.empty:
             st.markdown('<div class="tertiary-text red-accent">NULL: AUCUNE CORRESPONDANCE TROUVÉE.</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="tertiary-text">RÉSULTATS (Cochez pour exporter)</div><br>', unsafe_allow_html=True)
-            
+
             for idx, row in filtered_df.iterrows():
                 expander_title = f"{row['DateLabel']} | {row['NomOrateur']} ({row['Qualite']}) | {str(row['Sequence'])[:40]}..."
-                
+
                 with st.expander(expander_title, expanded=False):
                     chk_key = f"chk_{row['DateSortKey']}_{idx}"
                     st.checkbox("INCLURE DANS L'EXPORT", key=chk_key)
                     st.markdown("---")
-                    
+
                     st.markdown(f"""
                         <div class="tertiary-text" style="line-height: 1.8;">
                         DATE &nbsp;&nbsp;&nbsp;&nbsp;: {row['DateLabel']} (SÉANCE : {row['Moment']})<br>
@@ -484,7 +699,7 @@ def main():
                         DÉTECTION: <span class="red-accent">{row['MotsTrouves'].upper()}</span>
                         </div><br>
                     """, unsafe_allow_html=True)
-                    
+
                     st.markdown(f'<div style="line-height: 1.6; text-align: justify;">{row["VerbatimHighlight"]}</div>', unsafe_allow_html=True)
                     if row['Reactions']:
                         st.markdown(f'<br><div class="tertiary-text">RX: {row["Reactions"]}</div>', unsafe_allow_html=True)
