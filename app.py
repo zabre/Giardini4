@@ -4,6 +4,7 @@ import zipfile
 import io
 import pandas as pd
 import re
+import time
 from lxml import etree
 from bs4 import BeautifulSoup
 
@@ -201,13 +202,26 @@ def boolean_search_and_highlight(df: pd.DataFrame, query: str):
 
 # ==========================================
 # MOTEUR 1 : ASSEMBLÉE NATIONALE (FRANCE)
+# FIX v2 : stream=True + timeout=300s pour fichier ~46MB
+# L'ancien timeout=30 expirait avant la fin du téléchargement (~30KB/s)
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
 def fetch_and_index_fr(url):
     try:
-        response = requests.get(url, timeout=30); response.raise_for_status(); zip_bytes = response.content
-    except Exception: return None, None
-    catalog = {}; regex_file = re.compile(r"(S\d+\.N\d*\.xml|CRSANR.*\.xml)", re.IGNORECASE)
+        # stream=True maintient la connexion active pendant tout le téléchargement
+        # timeout=300 donne 5 minutes de marge pour un fichier de ~46MB
+        response = requests.get(url, timeout=300, stream=True)
+        response.raise_for_status()
+        chunks = []
+        for chunk in response.iter_content(chunk_size=512 * 1024):  # chunks de 512KB
+            if chunk:
+                chunks.append(chunk)
+        zip_bytes = b"".join(chunks)
+    except Exception:
+        return None, None
+
+    catalog = {}
+    regex_file = re.compile(r"(S\d+\.N\d*\.xml|CRSANR.*\.xml)", re.IGNORECASE)
     ns = {'an': 'http://schemas.assemblee-nationale.fr/referentiel'}
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
@@ -220,7 +234,8 @@ def fetch_and_index_fr(url):
                         sort_key = parse_french_date_to_sortable(raw_date)
                         if sort_key not in catalog: catalog[sort_key] = {"label": raw_date, "files": []}
                         catalog[sort_key]["files"].append(filename)
-    except zipfile.BadZipFile: return None, None
+    except zipfile.BadZipFile:
+        return None, None
     return zip_bytes, dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
 
 @st.cache_data(show_spinner=False)
@@ -319,12 +334,14 @@ def parse_selected_dates_eu(dummy, selected_dates_info):
 
 # ==========================================
 # MOTEUR 3 : CONGRÈS AMÉRICAIN (US)
+# FIX v2 : endpoint fullIssue (1 req/séance) + throttle 0.5s anti-rate-limit
+# L'ancien moteur envoyait 20-30 req simultanées explosant le rate limit DEMO_KEY
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
 def fetch_and_index_us():
     api_key = get_secret_key("CONGRESS_API_KEY", "DEMO_KEY")
     url = "https://api.congress.gov/v3/daily-congressional-record"
-    params = {"api_key": api_key, "limit": 100, "format": "json"}
+    params = {"api_key": api_key, "limit": 20, "format": "json"}
     try:
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status(); issues = response.json().get("dailyCongressionalRecord", [])
@@ -348,38 +365,47 @@ def parse_selected_dates_us(dummy, selected_dates_info):
         date_label = info['label'].split(" ")[0]
         for file_id in info['files']:
             vol, num = file_id.split('/')
-            art_url = f"https://api.congress.gov/v3/daily-congressional-record/{vol}/{num}/articles"
+            # fullIssue : 1 seule requête API pour toute la structure de la séance
+            detail_url = f"https://api.congress.gov/v3/daily-congressional-record/{vol}/{num}"
             try:
-                resp = requests.get(art_url, params={"api_key": api_key, "format": "json"}, timeout=30)
+                resp = requests.get(detail_url, params={"api_key": api_key, "format": "json"}, timeout=30)
                 if resp.status_code != 200: continue
-                articles = resp.json().get('articles', [])
+                sections = resp.json().get('issue', {}).get('fullIssue', {}).get('sections', [])
             except Exception: continue
-            for section in articles:
-                chamber = section.get('name', 'SECTION UNKNOWN')
-                for article in section.get('sectionArticles', []):
-                    title = article.get('title', 'DEBATE')
-                    for text_item in article.get('text', []):
-                        if text_item.get('type') == 'Formatted Text':
-                            try:
-                                htm_resp = requests.get(text_item['url'], timeout=30)
-                                if htm_resp.status_code != 200: continue
-                                soup = BeautifulSoup(htm_resp.content, 'html.parser')
-                                paras = soup.find_all('p')
-                                if paras:
-                                    verbatim = " \n".join([p.get_text().strip() for p in paras if p.get_text().strip()])
+            for section in sections:
+                chamber = section.get('name', 'UNKNOWN')
+                if chamber not in ['Senate Section', 'House Section', 'Extensions of Remarks Section']:
+                    continue
+                for text_item in section.get('text', []):
+                    if text_item.get('type') == 'Formatted Text':
+                        try:
+                            time.sleep(0.5)  # throttle anti-rate-limit
+                            htm_resp = requests.get(text_item['url'], timeout=30)
+                            if htm_resp.status_code != 200: continue
+                            soup = BeautifulSoup(htm_resp.content, 'html.parser')
+                            full_text = soup.get_text(separator="\n")
+                            blocks = re.split(r'\n(?=\s{2,}(?:Mr\.|Ms\.|Mrs\.|The SPEAKER|The PRESIDENT|The CHAIR))', full_text)
+                            for block in blocks:
+                                block = block.strip()
+                                if len(block) < 30: continue
+                                speaker_match = re.match(
+                                    r'((?:Mr\.|Ms\.|Mrs\.|The\s[A-Z][A-Z\s]+)[\s]+[A-Z][A-Za-z\s\.\-\']+?)[\.s]*\n?(.*)',
+                                    block, re.DOTALL
+                                )
+                                if speaker_match:
+                                    nom_orateur = speaker_match.group(1).strip().upper()
+                                    verbatim = speaker_match.group(2).strip()
                                 else:
-                                    pre = soup.find('pre')
-                                    verbatim = pre.get_text().strip() if pre else soup.get_text().strip()
-                                if not verbatim: continue
-                                nom_orateur = "CONGRESS MEMBER"
-                                speaker_match = re.search(r'^\s*(?:Mr\.|Ms\.|Mrs\.|The\s[A-Z\s]+)\s+([A-Za-z\s\.\'-]+)\.', verbatim)
-                                if speaker_match: nom_orateur = speaker_match.group(0).strip(' .')
+                                    nom_orateur = "CONGRESSIONAL RECORD"
+                                    verbatim = block
+                                if not verbatim or len(verbatim) < 20: continue
                                 data.append({"DateSortKey": sort_key, "DateLabel": date_label,
-                                    "Moment": chamber.upper(), "SujetDebat": title.upper(),
-                                    "Sequence": f"VOL.{vol} NO.{num}", "NomOrateur": nom_orateur.upper(),
+                                    "Moment": chamber.upper(),
+                                    "SujetDebat": f"{chamber.upper()} — {sort_key}",
+                                    "Sequence": f"VOL.{vol} NO.{num}", "NomOrateur": nom_orateur,
                                     "Qualite": chamber.replace(" Section", "").upper(),
                                     "Verbatim": verbatim, "Reactions": ""})
-                            except Exception: continue
+                        except Exception: continue
     return pd.DataFrame(data)
 
 # ==========================================
@@ -436,7 +462,13 @@ def main():
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ SOURCE DES DONNÉES ]</div>', unsafe_allow_html=True)
     institution = st.sidebar.radio("INSTITUTION", ["ASSEMBLÉE NATIONALE (FR)", "PARLEMENT EUROPÉEN (UE)", "CONGRÈS AMÉRICAIN (US)"])
 
-    with st.spinner(f"SYNCHRONISATION ({institution.split('(')[1].replace(')','')})..."):
+    spinner_label = institution.split('(')[1].replace(')', '') if '(' in institution else 'DATA'
+    if "FR" in institution:
+        spinner_msg = "SYNCHRONISATION (FR)... [ FICHIER ~46MB — PATIENCE ]"
+    else:
+        spinner_msg = f"SYNCHRONISATION ({spinner_label})..."
+
+    with st.spinner(spinner_msg):
         if "FR" in institution:
             url = "https://data.assemblee-nationale.fr/static/openData/repository/17/vp/syceronbrut/syseron.xml.zip"
             source_bytes, catalog = fetch_and_index_fr(url)
@@ -463,9 +495,8 @@ def main():
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE BOOLÉEN ]</div>', unsafe_allow_html=True)
     bool_query = st.sidebar.text_input(
         "REQUÊTE",
-        placeholder="EX: MACRON AND (NUCL\u00c9AIRE OR \u00c9NERGIE) NOT GUERRE"
+        placeholder="EX: MACRON AND (NUCLÉAIRE OR ÉNERGIE) NOT GUERRE"
     )
-    # Apostrophes en entités HTML pour éviter de fermer les guillemets simples Python
     st.sidebar.markdown(
         "<div class='bool-help'>"
         "Op&eacute;rateurs support&eacute;s :<br>"
