@@ -73,6 +73,19 @@ def get_secret_key(secret_name, default_val):
     except (FileNotFoundError, KeyError):
         return default_val
 
+# Headers mimant un navigateur pour éviter les blocages serveur (User-Agent filter)
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
 # ==========================================
 # MOTEUR DE RECHERCHE BOOLÉEN
 # ==========================================
@@ -202,22 +215,36 @@ def boolean_search_and_highlight(df: pd.DataFrame, query: str):
 
 # ==========================================
 # MOTEUR 1 : ASSEMBLÉE NATIONALE (FRANCE)
-# FIX v2 : stream=True + timeout=300s pour fichier ~46MB
-# L'ancien timeout=30 expirait avant la fin du téléchargement (~30KB/s)
+# - stream=True + timeout=300s pour fichier ~46MB
+# - BROWSER_HEADERS pour éviter le blocage par User-Agent filter
+# - Logs d'erreur détaillés pour diagnostiquer les régressions
 # ==========================================
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def fetch_and_index_fr(url):
     try:
-        # stream=True maintient la connexion active pendant tout le téléchargement
-        # timeout=300 donne 5 minutes de marge pour un fichier de ~46MB
-        response = requests.get(url, timeout=300, stream=True)
+        response = requests.get(
+            url,
+            timeout=300,
+            stream=True,
+            headers=BROWSER_HEADERS
+        )
         response.raise_for_status()
         chunks = []
-        for chunk in response.iter_content(chunk_size=512 * 1024):  # chunks de 512KB
+        for chunk in response.iter_content(chunk_size=512 * 1024):
             if chunk:
                 chunks.append(chunk)
         zip_bytes = b"".join(chunks)
-    except Exception:
+    except requests.exceptions.Timeout as e:
+        st.error(f"[FR] TIMEOUT après 300s : {e}")
+        return None, None
+    except requests.exceptions.HTTPError as e:
+        st.error(f"[FR] ERREUR HTTP {e.response.status_code} : {e}")
+        return None, None
+    except requests.exceptions.ConnectionError as e:
+        st.error(f"[FR] ERREUR RÉSEAU / DNS : {e}")
+        return None, None
+    except Exception as e:
+        st.error(f"[FR] ERREUR INCONNUE : {type(e).__name__} — {e}")
         return None, None
 
     catalog = {}
@@ -234,7 +261,8 @@ def fetch_and_index_fr(url):
                         sort_key = parse_french_date_to_sortable(raw_date)
                         if sort_key not in catalog: catalog[sort_key] = {"label": raw_date, "files": []}
                         catalog[sort_key]["files"].append(filename)
-    except zipfile.BadZipFile:
+    except zipfile.BadZipFile as e:
+        st.error(f"[FR] ZIP CORROMPU : {e}")
         return None, None
     return zip_bytes, dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
 
@@ -282,9 +310,11 @@ def fetch_and_index_eu():
     try:
         url = "https://data.europarl.europa.eu/api/v2/plenary-session-documents"
         params = {"work_type": "def/ep-document-types/CRE_PLENARY", "limit": 1000}
-        response = requests.get(url, params=params, headers={"Accept": "application/ld+json"}, timeout=30)
+        response = requests.get(url, params=params, headers={**BROWSER_HEADERS, "Accept": "application/ld+json"}, timeout=30)
         response.raise_for_status(); data = response.json().get("data", [])
-    except Exception: return None, None
+    except Exception as e:
+        st.error(f"[UE] ERREUR : {type(e).__name__} — {e}")
+        return None, None
     catalog = {}
     for doc in data:
         doc_id = doc.get("identifier", "")
@@ -307,7 +337,7 @@ def parse_selected_dates_eu(dummy, selected_dates_info):
         for doc_id in info['files']:
             xml_url = f"https://www.europarl.europa.eu/doceo/document/{doc_id}_FR.xml"
             try:
-                resp = requests.get(xml_url, timeout=30)
+                resp = requests.get(xml_url, headers=BROWSER_HEADERS, timeout=30)
                 if resp.status_code != 200: continue
                 root = etree.fromstring(resp.content)
             except Exception: continue
@@ -334,8 +364,6 @@ def parse_selected_dates_eu(dummy, selected_dates_info):
 
 # ==========================================
 # MOTEUR 3 : CONGRÈS AMÉRICAIN (US)
-# FIX v2 : endpoint fullIssue (1 req/séance) + throttle 0.5s anti-rate-limit
-# L'ancien moteur envoyait 20-30 req simultanées explosant le rate limit DEMO_KEY
 # ==========================================
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def fetch_and_index_us():
@@ -343,9 +371,11 @@ def fetch_and_index_us():
     url = "https://api.congress.gov/v3/daily-congressional-record"
     params = {"api_key": api_key, "limit": 20, "format": "json"}
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=30)
         response.raise_for_status(); issues = response.json().get("dailyCongressionalRecord", [])
-    except Exception: return None, None
+    except Exception as e:
+        st.error(f"[US] ERREUR : {type(e).__name__} — {e}")
+        return None, None
     catalog = {}
     for issue in issues:
         date_raw = issue.get("issueDate", "")[:10]
@@ -365,10 +395,9 @@ def parse_selected_dates_us(dummy, selected_dates_info):
         date_label = info['label'].split(" ")[0]
         for file_id in info['files']:
             vol, num = file_id.split('/')
-            # fullIssue : 1 seule requête API pour toute la structure de la séance
             detail_url = f"https://api.congress.gov/v3/daily-congressional-record/{vol}/{num}"
             try:
-                resp = requests.get(detail_url, params={"api_key": api_key, "format": "json"}, timeout=30)
+                resp = requests.get(detail_url, params={"api_key": api_key, "format": "json"}, headers=BROWSER_HEADERS, timeout=30)
                 if resp.status_code != 200: continue
                 sections = resp.json().get('issue', {}).get('fullIssue', {}).get('sections', [])
             except Exception: continue
@@ -379,8 +408,8 @@ def parse_selected_dates_us(dummy, selected_dates_info):
                 for text_item in section.get('text', []):
                     if text_item.get('type') == 'Formatted Text':
                         try:
-                            time.sleep(0.5)  # throttle anti-rate-limit
-                            htm_resp = requests.get(text_item['url'], timeout=30)
+                            time.sleep(0.5)
+                            htm_resp = requests.get(text_item['url'], headers=BROWSER_HEADERS, timeout=30)
                             if htm_resp.status_code != 200: continue
                             soup = BeautifulSoup(htm_resp.content, 'html.parser')
                             full_text = soup.get_text(separator="\n")
@@ -436,7 +465,7 @@ def generate_html_export(df, theme, institution, query=""):
     for _, row in df.iterrows():
         html += f"""<div class="item">
             <div class="orateur">{row['NomOrateur']} [{row['Qualite']}]</div>
-            <div class="metadata">DATE: {row['DateLabel']} ({row['Moment']}) <br> SUJET: {row['SujetDebat']} <br> SÉQUENCE: {row['Sequence']}</div>
+            <div class="metadata">DATE: {row['DateLabel']} (SÉANCE : {row['Moment']}) <br> SUJET: {row['SujetDebat']} <br> SÉQUENCE: {row['Sequence']}</div>
             <div class="verbatim">{row['VerbatimHighlight']}</div>"""
         if row['Reactions']: html += f'<div class="reactions">RX: {row["Reactions"]}</div>'
         html += "</div>"
@@ -462,11 +491,12 @@ def main():
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ SOURCE DES DONNÉES ]</div>', unsafe_allow_html=True)
     institution = st.sidebar.radio("INSTITUTION", ["ASSEMBLÉE NATIONALE (FR)", "PARLEMENT EUROPÉEN (UE)", "CONGRÈS AMÉRICAIN (US)"])
 
-    spinner_label = institution.split('(')[1].replace(')', '') if '(' in institution else 'DATA'
     if "FR" in institution:
         spinner_msg = "SYNCHRONISATION (FR)... [ FICHIER ~46MB — PATIENCE ]"
+    elif "UE" in institution:
+        spinner_msg = "SYNCHRONISATION (UE)..."
     else:
-        spinner_msg = f"SYNCHRONISATION ({spinner_label})..."
+        spinner_msg = "SYNCHRONISATION (US)..."
 
     with st.spinner(spinner_msg):
         if "FR" in institution:
@@ -478,7 +508,7 @@ def main():
             source_bytes, catalog = fetch_and_index_us()
 
     if not source_bytes or not catalog:
-        st.markdown('<div class="tertiary-text red-accent">ERROR: SOURCE DE DONNÉES INACCESSIBLE OU CLÉ API INVALIDE</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tertiary-text red-accent">ERROR: SOURCE DE DONNÉES INACCESSIBLE. VOIR DÉTAILS CI-DESSUS.</div>', unsafe_allow_html=True)
         st.stop()
 
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ DATES DES SÉANCES ]</div>', unsafe_allow_html=True)
