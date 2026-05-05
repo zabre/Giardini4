@@ -73,7 +73,7 @@ def get_secret_key(secret_name, default_val):
     except (FileNotFoundError, KeyError):
         return default_val
 
-# Headers mimant un navigateur pour éviter les blocages serveur (User-Agent filter)
+# Headers navigateur pour éviter les blocages User-Agent
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -82,9 +82,68 @@ BROWSER_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
+
+def download_with_resume(url, max_retries=10, chunk_size=512 * 1024, timeout=60):
+    """
+    Télécharge un fichier avec reprise automatique via HTTP Range headers.
+    Corrige le ChunkedEncodingError du CDN de l'Assemblée Nationale qui
+    coupe la connexion après ~12MB sur un fichier de ~46MB.
+
+    Stratégie : on accumule les chunks reçus, et si la connexion se coupe,
+    on repart depuis l'offset exact via l'en-tête Range: bytes=<offset>-
+    jusqu'à avoir reçu la totalité du fichier.
+    """
+    buffer = bytearray()
+    attempt = 0
+
+    # Vérifier d'abord si le serveur supporte les Range requests
+    head = requests.head(url, headers=BROWSER_HEADERS, timeout=timeout)
+    total_size = int(head.headers.get("Content-Length", 0))
+    accepts_ranges = head.headers.get("Accept-Ranges", "none").lower() != "none"
+
+    while attempt < max_retries:
+        offset = len(buffer)
+        if total_size > 0 and offset >= total_size:
+            break  # Téléchargement complet
+
+        headers = {**BROWSER_HEADERS}
+        if accepts_ranges and offset > 0:
+            headers["Range"] = f"bytes={offset}-"
+
+        try:
+            resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
+            # 206 = Partial Content (Range accepté), 200 = pas de Range support
+            if resp.status_code not in (200, 206):
+                raise requests.exceptions.HTTPError(
+                    f"HTTP {resp.status_code}", response=resp
+                )
+            # Si le serveur ignore le Range et renvoie 200, on repart de zéro
+            if resp.status_code == 200 and offset > 0:
+                buffer = bytearray()
+
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    buffer.extend(chunk)
+
+            break  # Succès : sortie de la boucle retry
+
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout) as e:
+            attempt += 1
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"[FR] Échec après {max_retries} tentatives. "
+                    f"Dernière erreur : {type(e).__name__} — {e}"
+                )
+            wait = 2 ** attempt  # backoff exponentiel : 2s, 4s, 8s...
+            time.sleep(wait)
+            continue
+
+    return bytes(buffer)
+
 
 # ==========================================
 # MOTEUR DE RECHERCHE BOOLÉEN
@@ -215,36 +274,21 @@ def boolean_search_and_highlight(df: pd.DataFrame, query: str):
 
 # ==========================================
 # MOTEUR 1 : ASSEMBLÉE NATIONALE (FRANCE)
-# - stream=True + timeout=300s pour fichier ~46MB
-# - BROWSER_HEADERS pour éviter le blocage par User-Agent filter
-# - Logs d'erreur détaillés pour diagnostiquer les régressions
+# Fix ChunkedEncodingError : download_with_resume() avec Range headers
+# Le CDN de l'AN coupe la connexion après ~12MB — on reprend là où on s'est arrêté
 # ==========================================
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def fetch_and_index_fr(url):
     try:
-        response = requests.get(
-            url,
-            timeout=300,
-            stream=True,
-            headers=BROWSER_HEADERS
-        )
-        response.raise_for_status()
-        chunks = []
-        for chunk in response.iter_content(chunk_size=512 * 1024):
-            if chunk:
-                chunks.append(chunk)
-        zip_bytes = b"".join(chunks)
-    except requests.exceptions.Timeout as e:
-        st.error(f"[FR] TIMEOUT après 300s : {e}")
+        zip_bytes = download_with_resume(url)
+    except RuntimeError as e:
+        st.error(str(e))
         return None, None
     except requests.exceptions.HTTPError as e:
         st.error(f"[FR] ERREUR HTTP {e.response.status_code} : {e}")
         return None, None
-    except requests.exceptions.ConnectionError as e:
-        st.error(f"[FR] ERREUR RÉSEAU / DNS : {e}")
-        return None, None
     except Exception as e:
-        st.error(f"[FR] ERREUR INCONNUE : {type(e).__name__} — {e}")
+        st.error(f"[FR] ERREUR INATTENDUE : {type(e).__name__} — {e}")
         return None, None
 
     catalog = {}
@@ -262,7 +306,7 @@ def fetch_and_index_fr(url):
                         if sort_key not in catalog: catalog[sort_key] = {"label": raw_date, "files": []}
                         catalog[sort_key]["files"].append(filename)
     except zipfile.BadZipFile as e:
-        st.error(f"[FR] ZIP CORROMPU : {e}")
+        st.error(f"[FR] ZIP CORROMPU (téléchargement incomplet?) : {e}")
         return None, None
     return zip_bytes, dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
 
@@ -482,7 +526,6 @@ def main():
     st.markdown('<div class="hero-title">GIARDINI</div>', unsafe_allow_html=True)
     st.markdown('<span class="hero-subtitle">Veille des débats parlementaires en France, en UE et aux US</span>', unsafe_allow_html=True)
 
-    # --- SIDEBAR ---
     st.sidebar.markdown('<div class="tertiary-text red-accent">[ PARAMÈTRES UI ]</div>', unsafe_allow_html=True)
     theme_choice = st.sidebar.radio("THÈME", ["DARK", "LIGHT"], index=0 if st.session_state.ui_theme == "DARK" else 1, horizontal=True)
     if theme_choice != st.session_state.ui_theme:
@@ -492,7 +535,7 @@ def main():
     institution = st.sidebar.radio("INSTITUTION", ["ASSEMBLÉE NATIONALE (FR)", "PARLEMENT EUROPÉEN (UE)", "CONGRÈS AMÉRICAIN (US)"])
 
     if "FR" in institution:
-        spinner_msg = "SYNCHRONISATION (FR)... [ FICHIER ~46MB — PATIENCE ]"
+        spinner_msg = "SYNCHRONISATION (FR)... [ REPRISE AUTOMATIQUE SI COUPURE RÉSEAU ]"
     elif "UE" in institution:
         spinner_msg = "SYNCHRONISATION (UE)..."
     else:
@@ -521,7 +564,6 @@ def main():
         st.markdown('<div class="tertiary-text red-accent">SYS.HALT: VEUILLEZ SÉLECTIONNER AU MOINS UNE DATE.</div>', unsafe_allow_html=True)
         st.stop()
 
-    # --- MOTEUR DE RECHERCHE BOOLÉEN ---
     st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE BOOLÉEN ]</div>', unsafe_allow_html=True)
     bool_query = st.sidebar.text_input(
         "REQUÊTE",
