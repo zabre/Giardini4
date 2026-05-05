@@ -9,10 +9,10 @@ Recherche booléenne full-text dans les verbatims de séance, surlignage des occ
 ## Fonctionnalités
 
 - 🇫🇷 **Assemblée Nationale** — Comptes rendus XML de la 17e législature (open data officiel)
-- 🇪🇺 **Parlement Européen** — Comptes rendus de plénière via l’API open data Europarl
-- 🇺🇸 **Congrès US** — Daily Congressional Record via l’API congress.gov
+- 🇪🇺 **Parlement Européen** — Comptes rendus de plénière via l'API open data Europarl
+- 🇺🇸 **Congrès US** — Daily Congressional Record via l'API congress.gov
 - 🔍 Moteur de recherche **booléen** : `AND`, `OR`, `NOT`, `(groupements)`, `"phrases exactes"`
-- 📈 Courbe d’évolution temporelle des mentions (rouge `#D71921`)
+- 📈 Courbe d'évolution temporelle des mentions (rouge `#D71921`)
 - ✅ Sélection granulaire des résultats pour export HTML thémé (DARK / LIGHT)
 - 🎨 Design system industriel — thème DARK / LIGHT dynamique
 
@@ -59,10 +59,11 @@ Obtenez une clé gratuite sur [api.congress.gov](https://api.congress.gov/).
 
 ```
 app.py
+├── download_with_resume()         # Téléchargement avec retry Range headers (fix ChunkedEncodingError)
 ├── inject_custom_css()            # Design system DARK/LIGHT
 ├── boolean_search_and_highlight() # Moteur booléen (AND/OR/NOT/phrases)
 ├── MOTEUR 1 — FRANCE
-│   ├── fetch_and_index_fr()       # Téléchargement streaming ZIP ~46MB (timeout 300s)
+│   ├── fetch_and_index_fr()       # Téléchargement robuste ZIP ~46MB via download_with_resume()
 │   └── parse_selected_dates_fr()  # Parsing XML comptes rendus AN
 ├── MOTEUR 2 — UE
 │   ├── fetch_and_index_eu()       # Index via API Europarl open data
@@ -78,24 +79,38 @@ app.py
 
 ## Notes techniques
 
-### Fix v2 — Synchronisation France (mai 2026)
+### Fix v2.1 — ChunkedEncodingError France (mai 2026)
 
-Le fichier `syseron.xml.zip` fait **~46MB** et le serveur open data de l’Assemblée Nationale délivre à ~30KB/s depuis l’extérieur.  
-L’ancien `timeout=30` expirait systématiquement avant la fin du téléchargement, causant une boucle de chargement infinie.
+**Problème** : Le CDN de l'Assemblée Nationale **coupe la connexion TCP après ~12MB** sur un fichier de 46MB.  
+Erreur : `ChunkedEncodingError — IncompleteRead(12189330 bytes read, 33612760 more expected)`
 
-**Solution implémentée :**
-- `stream=True` + `iter_content(chunk_size=512KB)` — maintient la connexion active
-- `timeout=300` — 5 minutes de marge
-- `@st.cache_data(ttl=12h)` — le fichier est mis en cache après le 1er chargement réussi, les suivants sont instantanés
+**Cause** : Timeout côté serveur CDN (OVH) sur les connexions longues, indépendant de `timeout=` côté client.
 
-### Fix v2 — Moteur US Congress (mai 2026)
+**Solution** — fonction `download_with_resume()` :
+- Détection du support `Accept-Ranges` via `HEAD` avant le téléchargement
+- En cas de coupure, reprise exacte depuis l'offset reçu via l'en-tête HTTP `Range: bytes=<offset>-`
+- **Backoff exponentiel** entre les tentatives : 2s, 4s, 8s… jusqu'à 10 retries max
+- Si le serveur ne supporte pas `Range` (réponse 200 au lieu de 206), reprise depuis zéro
+- `@st.cache_data(ttl=12h)` — mis en cache après le 1er téléchargement réussi
 
-L’ancien moteur envoyait 20–30 requêtes HTTP simultanées (1 par article), explosant le rate limit de la `DEMO_KEY` (5 req/min).
+```python
+# Schéma simplifié de la stratégie
+buffer = bytearray()
+while not complete:
+    headers["Range"] = f"bytes={len(buffer)}-"  # Reprendre là où on s'est arrêté
+    for chunk in requests.get(url, stream=True).iter_content(512KB):
+        buffer.extend(chunk)
+    # Si ChunkedEncodingError : wait 2^attempt secondes, retry
+```
 
-**Solution implémentée :**
-- Endpoint `fullIssue` : **1 seule requête API** pour récupérer toute la structure d’une séance
-- `time.sleep(0.5)` entre chaque fetch HTM pour respecter le rate limit
-- Parsing regex des blocs de parole (pattern `Mr./Ms./The SPEAKER...`)
+### Fix v2.0 — Synchronisation France (mai 2026)
+
+L'ancien `timeout=30` expirait sur un fichier de 46MB livré à ~30KB/s. Résolution : `stream=True` + `timeout=300`.
+
+### Fix v2.0 — Moteur US Congress (mai 2026)
+
+L'ancien moteur envoyait 20–30 requêtes HTTP simultанées, explosant le rate limit de la `DEMO_KEY`.  
+**Solution** : endpoint `fullIssue` (1 requête par séance) + `time.sleep(0.5)` entre les fetches HTM.
 
 ---
 
@@ -111,11 +126,16 @@ L’ancien moteur envoyait 20–30 requêtes HTTP simultanées (1 par article), 
 
 ## Changelog
 
+### v2.1.0 — Mai 2026
+- ✅ **Fix majeur** synchronisation France : `download_with_resume()` avec `Range` headers + backoff exponentiel
+- ✅ Résout `ChunkedEncodingError — IncompleteRead` (CDN AN coupe après ~12MB)
+- ✅ Jusqu'à 10 retries automatiques avec reprise depuis l'offset exact
+- ✅ Headers `User-Agent` navigateur pour éviter les blocages CDN
+
 ### v2.0.0 — Mai 2026
 - ✅ Fix synchronisation France : streaming ZIP + timeout 300s (résout la boucle infinie)
 - ✅ Fix moteur US : endpoint `fullIssue` + throttle anti-rate-limit
 - ✅ Graphique temporel : `st.line_chart`, courbe rouge `#D71921`
-- ✅ Message spinner FR explicite : `[ FICHIER ~46MB — PATIENCE ]`
 - ✅ `import time` ajouté (requis pour `time.sleep`)
 
 ### v1.0.0 — Avril 2026
