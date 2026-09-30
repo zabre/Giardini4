@@ -1,660 +1,1390 @@
-import streamlit as st
-import requests
-import zipfile
 import io
-import pandas as pd
 import re
 import time
-from lxml import etree
-from bs4 import BeautifulSoup
+import zipfile
+from datetime import date, datetime, timedelta
+from urllib.parse import urljoin
 
-# ==========================================
-# CONFIGURATION ET UI
-# ==========================================
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from lxml import etree
+
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
 st.set_page_config(
-    page_title="GIARDINI | Veille Parlementaire",
-    page_icon="🏛️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+ page_title="GIARDINI | Veille parlementaire",
+ page_icon="🏛️",
+ layout="wide",
+ initial_sidebar_state="expanded",
 )
 
-def inject_custom_css(theme):
-    if theme == "LIGHT":
-        bg_color = "#F4F4F0"; bg_sec_color = "#EAEAE5"; text_color = "#1A1A1A"
-        border_color = "#D2D2D2"; muted_color = "#777777"
-    else:
-        bg_color = "#000000"; bg_sec_color = "#0A0A0A"; text_color = "#FFFFFF"
-        border_color = "#333333"; muted_color = "#666666"
+AN_TRANSCRIPTS_URL = (
+ "https://data.assemblee-nationale.fr/static/openData/"
+ "repository/17/vp/syceronbrut/syseron.xml.zip"
+)
 
-    st.markdown(f"""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Doto:wght@700;900&family=Space+Grotesk:wght@400;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
-    :root {{ --bg: {bg_color}; --bg-sec: {bg_sec_color}; --text: {text_color}; --border: {border_color}; --muted: {muted_color}; --accent: #D71921; }}
-    html, body, [class*="css"], .stApp {{ font-family: 'Space Grotesk', sans-serif !important; background-color: var(--bg) !important; color: var(--text) !important; }}
-    #MainMenu {{visibility: hidden;}} header {{visibility: hidden;}} footer {{visibility: hidden;}}
-    div[data-testid="stDecoration"] {{display: none;}}
-    .hero-title {{ font-family: 'Doto', sans-serif; font-size: 6vw; font-weight: 900; line-height: 0.9; letter-spacing: -2px; text-transform: uppercase; margin: 0; padding: 0; color: var(--text); }}
-    .hero-subtitle {{ font-family: 'Space Mono', monospace; font-size: 14px; color: var(--accent); text-transform: uppercase; letter-spacing: 4px; margin-bottom: 40px; display: block; }}
-    .tertiary-text {{ font-family: 'Space Mono', monospace; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }}
-    .red-accent {{ color: var(--accent) !important; }}
-    .bool-help {{ font-family: 'Space Mono', monospace; font-size: 10px; color: var(--muted); line-height: 1.6; padding: 8px; border-left: 2px solid var(--accent); margin-top: 6px; }}
-    .bool-error {{ font-family: 'Space Mono', monospace; font-size: 10px; color: var(--accent); padding: 6px 8px; border: 1px solid var(--accent); margin-top: 6px; }}
-    div[data-testid="stExpander"] {{ background-color: var(--bg) !important; border: 1px solid var(--border) !important; border-radius: 0px !important; box-shadow: none !important; margin-bottom: 10px; }}
-    div[data-testid="stExpander"] summary {{ font-family: 'Space Grotesk', sans-serif; font-weight: 600; color: var(--text) !important; }}
-    div.stTextInput > div > div > input, div[data-baseweb="select"] > div {{ border-radius: 4px !important; border: 1px solid var(--border) !important; background-color: var(--bg-sec) !important; font-family: 'Space Mono', monospace !important; font-size: 13px !important; color: var(--text) !important; }}
-    div.stTextInput > div > div > input:focus {{ border-color: var(--accent) !important; box-shadow: none !important; }}
-    span[data-baseweb="tag"] {{ background-color: var(--accent) !important; color: #FFF !important; border-radius: 0px !important; border: none !important; font-family: 'Space Mono', monospace !important; font-size: 11px !important; }}
-    label[data-testid="stWidgetLabel"] {{ display: none; }}
-    div[role="radiogroup"] label {{ font-family: 'Space Mono', monospace !important; font-size: 12px !important; color: var(--text) !important; }}
-    div.stButton > button {{ background-color: var(--bg-sec) !important; color: var(--text) !important; border: 1px solid var(--border) !important; border-radius: 4px !important; font-family: 'Space Mono', monospace !important; text-transform: uppercase; letter-spacing: 1px; font-size: 12px !important; }}
-    div.stButton > button:hover {{ border-color: var(--accent) !important; color: var(--accent) !important; }}
-    mark.industrial-highlight {{ background-color: transparent; color: var(--accent); font-weight: bold; border-bottom: 2px solid var(--accent); padding: 0 2px; }}
-    ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
-    ::-webkit-scrollbar-track {{ background: var(--bg); }}
-    ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 0px; }}
-    ::-webkit-scrollbar-thumb:hover {{ background: var(--accent); }}
-    </style>
-    """, unsafe_allow_html=True)
+AN_AGENDA_URL = "https://www.assemblee-nationale.fr/agendas/index.asp"
 
-# ==========================================
-# UTILITAIRES COMMUNS
-# ==========================================
-def parse_french_date_to_sortable(datestr):
-    months = {"janvier":"01","février":"02","mars":"03","avril":"04","mai":"05","juin":"06",
-               "juillet":"07","août":"08","septembre":"09","octobre":"10","novembre":"11","décembre":"12"}
-    match = re.search(r"(\d{1,2})\s+([a-zéû]+)\s+(\d{4})", datestr.lower())
-    if match:
-        return f"{match.group(3)}-{months.get(match.group(2), '00')}-{match.group(1).zfill(2)}"
-    return "0000-00-00"
-
-def get_secret_key(secret_name, default_val):
-    try:
-        return st.secrets[secret_name]
-    except (FileNotFoundError, KeyError):
-        return default_val
-
-# Headers navigateur pour éviter les blocages User-Agent
 BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
+ "User-Agent": (
+ "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+ "AppleWebKit/537.36 (KHTML, like Gecko) "
+ "Chrome/124.0.0.0 Safari/537.36"
+ ),
+ "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+ "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
 }
 
-def download_with_resume(url, max_retries=10, chunk_size=512 * 1024, timeout=60):
-    """
-    Télécharge un fichier avec reprise automatique via HTTP Range headers.
-    Corrige le ChunkedEncodingError du CDN de l'Assemblée Nationale qui
-    coupe la connexion après ~12MB sur un fichier de ~46MB.
+MONTHS_FR = {
+ "janvier": 1,
+ "février": 2,
+ "mars": 3,
+ "avril": 4,
+ "mai": 5,
+ "juin": 6,
+ "juillet": 7,
+ "août": 8,
+ "septembre": 9,
+ "octobre": 10,
+ "novembre": 11,
+ "décembre": 12,
+}
 
-    Stratégie : on accumule les chunks reçus, et si la connexion se coupe,
-    on repart depuis l'offset exact via l'en-tête Range: bytes=<offset>-
-    jusqu'à avoir reçu la totalité du fichier.
-    """
-    buffer = bytearray()
-    attempt = 0
+AGENDA_COLUMNS = [
+ "EventId",
+ "Date",
+ "Heure",
+ "Type",
+ "Instance",
+ "Titre",
+ "Statut",
+ "SourceUrl",
+ "SourceUpdatedAt",
+]
 
-    # Vérifier d'abord si le serveur supporte les Range requests
-    head = requests.head(url, headers=BROWSER_HEADERS, timeout=timeout)
-    total_size = int(head.headers.get("Content-Length", 0))
-    accepts_ranges = head.headers.get("Accept-Ranges", "none").lower() != "none"
-
-    while attempt < max_retries:
-        offset = len(buffer)
-        if total_size > 0 and offset >= total_size:
-            break  # Téléchargement complet
-
-        headers = {**BROWSER_HEADERS}
-        if accepts_ranges and offset > 0:
-            headers["Range"] = f"bytes={offset}-"
-
-        try:
-            resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
-            # 206 = Partial Content (Range accepté), 200 = pas de Range support
-            if resp.status_code not in (200, 206):
-                raise requests.exceptions.HTTPError(
-                    f"HTTP {resp.status_code}", response=resp
-                )
-            # Si le serveur ignore le Range et renvoie 200, on repart de zéro
-            if resp.status_code == 200 and offset > 0:
-                buffer = bytearray()
-
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    buffer.extend(chunk)
-
-            break  # Succès : sortie de la boucle retry
-
-        except (requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ReadTimeout) as e:
-            attempt += 1
-            if attempt >= max_retries:
-                raise RuntimeError(
-                    f"[FR] Échec après {max_retries} tentatives. "
-                    f"Dernière erreur : {type(e).__name__} — {e}"
-                )
-            wait = 2 ** attempt  # backoff exponentiel : 2s, 4s, 8s...
-            time.sleep(wait)
-            continue
-
-    return bytes(buffer)
+PLF_COLUMNS = [
+ "EventId",
+ "Date",
+ "Etape",
+ "Instance",
+ "Titre",
+ "Statut",
+ "SourceUrl",
+ "SourceUpdatedAt",
+]
 
 
-# ==========================================
+# =========================================================
+# UI
+# =========================================================
+def inject_custom_css(theme: str) -> None:
+ light = theme == "LIGHT"
+
+ bg = "#F4F4F0" if light else "#000000"
+ bg_secondary = "#EAEAE5" if light else "#0A0A0A"
+ text = "#1A1A1A" if light else "#FFFFFF"
+ border = "#D2D2D2" if light else "#333333"
+ muted = "#777777"
+
+ st.markdown(
+ f"""
+ <style>
+ @import url('https://fonts.googleapis.com/css2?family=Doto:wght@700;900&family=Space+Grotesk:wght@400;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
+
+ :root {{
+ --bg: {bg};
+ --bg-secondary: {bg_secondary};
+ --text: {text};
+ --border: {border};
+ --muted: {muted};
+ --accent: #D71921;
+ }}
+
+ html, body, [class*="css"], .stApp {{
+ font-family: 'Space Grotesk', sans-serif !important;
+ background-color: var(--bg) !important;
+ color: var(--text) !important;
+ }}
+
+ #MainMenu, header, footer {{
+ visibility: hidden;
+ }}
+
+ .hero-title {{
+ font-family: 'Doto', sans-serif;
+ font-size: 6vw;
+ font-weight: 900;
+ line-height: 0.9;
+ letter-spacing: -2px;
+ text-transform: uppercase;
+ color: var(--text);
+ }}
+
+ .hero-subtitle {{
+ font-family: 'Space Mono', monospace;
+ font-size: 14px;
+ color: var(--accent);
+ text-transform: uppercase;
+ letter-spacing: 4px;
+ margin-bottom: 28px;
+ display: block;
+ }}
+
+ .tertiary {{
+ font-family: 'Space Mono', monospace;
+ font-size: 11px;
+ color: var(--muted);
+ text-transform: uppercase;
+ letter-spacing: 1px;
+ }}
+
+ .accent {{
+ color: var(--accent) !important;
+ }}
+
+ div[data-testid="stExpander"] {{
+ border: 1px solid var(--border) !important;
+ border-radius: 0 !important;
+ background-color: var(--bg) !important;
+ }}
+
+ div.stTextInput input,
+ div[data-baseweb="select"] > div {{
+ background-color: var(--bg-secondary) !important;
+ color: var(--text) !important;
+ border-color: var(--border) !important;
+ }}
+
+ mark.industrial-highlight {{
+ background-color: transparent;
+ color: var(--accent);
+ border-bottom: 2px solid var(--accent);
+ font-weight: 700;
+ }}
+ </style>
+ """,
+ unsafe_allow_html=True,
+ )
+
+
+# =========================================================
+# UTILITAIRES
+# =========================================================
+def clean_text(value: str) -> str:
+ return re.sub(r"\s+", " ", value or "").strip()
+
+
+def extract_french_date(text: str) -> date | None:
+ match = re.search(
+ r"\b(\d{1,2})\s+"
+ r"(janvier|février|mars|avril|mai|juin|juillet|août|"
+ r"septembre|octobre|novembre|décembre)\s+"
+ r"(20\d{2})\b",
+ text.lower(),
+ )
+
+ if not match:
+ return None
+
+ day, month_name, year = match.groups()
+
+ try:
+ return date(int(year), MONTHS_FR[month_name], int(day))
+ except ValueError:
+ return None
+
+
+def parse_french_date_to_sortable(value: str) -> str:
+ parsed = extract_french_date(value)
+ return parsed.isoformat() if parsed else "0000-00-00"
+
+
+def extract_time(text: str) -> str:
+ match = re.search(r"\b(\d{1,2})\s*h(?:\s*(\d{2}))?\b", text.lower())
+
+ if not match:
+ return ""
+
+ hour = int(match.group(1))
+ minute = int(match.group(2) or 0)
+
+ return f"{hour:02d}:{minute:02d}"
+
+
+def request_html(url: str) -> BeautifulSoup:
+ response = requests.get(
+ url,
+ headers=BROWSER_HEADERS,
+ timeout=30,
+ )
+ response.raise_for_status()
+
+ return BeautifulSoup(response.text, "html.parser")
+
+
+def download_with_resume(
+ url: str,
+ max_retries: int = 10,
+ chunk_size: int = 512 * 1024,
+) -> bytes:
+ """
+ Télécharge l'archive XML de l'Assemblée avec reprise HTTP Range.
+ Le CDN peut interrompre les téléchargements longs.
+ """
+ buffer = bytearray()
+
+ head = requests.head(
+ url,
+ headers=BROWSER_HEADERS,
+ timeout=30,
+ )
+ head.raise_for_status()
+
+ total_size = int(head.headers.get("Content-Length", 0))
+ accepts_ranges = (
+ head.headers.get("Accept-Ranges", "none").lower() != "none"
+ )
+
+ for attempt in range(max_retries):
+ offset = len(buffer)
+
+ if total_size and offset >= total_size:
+ return bytes(buffer)
+
+ headers = dict(BROWSER_HEADERS)
+
+ if accepts_ranges and offset > 0:
+ headers["Range"] = f"bytes={offset}-"
+
+ try:
+ response = requests.get(
+ url,
+ headers=headers,
+ stream=True,
+ timeout=60,
+ )
+ response.raise_for_status()
+
+ if response.status_code == 200 and offset > 0:
+ buffer = bytearray()
+
+ for chunk in response.iter_content(chunk_size=chunk_size):
+ if chunk:
+ buffer.extend(chunk)
+
+ return bytes(buffer)
+
+ except (
+ requests.exceptions.ChunkedEncodingError,
+ requests.exceptions.ConnectionError,
+ requests.exceptions.ReadTimeout,
+ ):
+ if attempt == max_retries - 1:
+ raise
+
+ time.sleep(2 ** (attempt + 1))
+
+ return bytes(buffer)
+
+
+# =========================================================
 # MOTEUR DE RECHERCHE BOOLÉEN
-# ==========================================
+# =========================================================
 class BooleanQueryError(Exception):
-    pass
+ pass
 
-TOKEN_AND    = 'AND'
-TOKEN_OR     = 'OR'
-TOKEN_NOT    = 'NOT'
-TOKEN_MINUS  = 'MINUS'
-TOKEN_LPAREN = 'LPAREN'
-TOKEN_RPAREN = 'RPAREN'
-TOKEN_PHRASE = 'PHRASE'
-TOKEN_TERM   = 'TERM'
-TOKEN_EOF    = 'EOF'
 
-def tokenize(query: str):
-    tokens = []
-    i = 0
-    q = query.strip()
-    while i < len(q):
-        if q[i].isspace():
-            i += 1; continue
-        if q[i] == '"':
-            j = q.find('"', i + 1)
-            if j == -1: raise BooleanQueryError('Guillemet fermant manquant.')
-            tokens.append((TOKEN_PHRASE, q[i+1:j])); i = j + 1; continue
-        if q[i] == '(':
-            tokens.append((TOKEN_LPAREN, '(')); i += 1; continue
-        if q[i] == ')':
-            tokens.append((TOKEN_RPAREN, ')')); i += 1; continue
-        if q[i] == '-' and (i == 0 or q[i-1].isspace() or q[i-1] == '('):
-            tokens.append((TOKEN_MINUS, '-')); i += 1; continue
-        j = i
-        while j < len(q) and not q[j].isspace() and q[j] not in '()"': j += 1
-        word = q[i:j]; upper = word.upper()
-        if upper == 'AND': tokens.append((TOKEN_AND, 'AND'))
-        elif upper == 'OR': tokens.append((TOKEN_OR, 'OR'))
-        elif upper == 'NOT': tokens.append((TOKEN_NOT, 'NOT'))
-        else: tokens.append((TOKEN_TERM, word))
-        i = j
-    tokens.append((TOKEN_EOF, ''))
-    return tokens
+def tokenize(query: str) -> list[tuple[str, str]]:
+ tokens = []
+ position = 0
 
-class Parser:
-    def __init__(self, tokens):
-        self.tokens = tokens; self.pos = 0
-    def peek(self):
-        return self.tokens[self.pos][0]
-    def consume(self, expected=None):
-        tok = self.tokens[self.pos]
-        if expected and tok[0] != expected:
-            raise BooleanQueryError(f"Attendu '{expected}', trouvé '{tok[1]}'")
-        self.pos += 1; return tok
-    def parse(self):
-        node = self.parse_or()
-        if self.peek() != TOKEN_EOF: raise BooleanQueryError("Requête mal formée.")
-        return node
-    def parse_or(self):
-        left = self.parse_and()
-        while self.peek() == TOKEN_OR:
-            self.consume(TOKEN_OR); right = self.parse_and(); left = ('OR', left, right)
-        return left
-    def parse_and(self):
-        left = self.parse_not()
-        while self.peek() not in (TOKEN_OR, TOKEN_RPAREN, TOKEN_EOF):
-            if self.peek() == TOKEN_AND: self.consume(TOKEN_AND)
-            right = self.parse_not(); left = ('AND', left, right)
-        return left
-    def parse_not(self):
-        if self.peek() in (TOKEN_NOT, TOKEN_MINUS):
-            self.consume(); return ('NOT', self.parse_primary())
-        return self.parse_primary()
-    def parse_primary(self):
-        tok_type, tok_val = self.tokens[self.pos]
-        if tok_type == TOKEN_TERM: self.consume(); return ('TERM', tok_val)
-        if tok_type == TOKEN_PHRASE: self.consume(); return ('PHRASE', tok_val)
-        if tok_type == TOKEN_LPAREN:
-            self.consume(TOKEN_LPAREN); node = self.parse_or(); self.consume(TOKEN_RPAREN); return node
-        raise BooleanQueryError(f"Token inattendu : '{tok_val}'")
+ while position < len(query):
+ char = query[position]
 
-def build_ast(query: str):
-    if not query.strip(): return None
-    return Parser(tokenize(query)).parse()
+ if char.isspace():
+ position += 1
+ continue
+
+ if char in "()":
+ tokens.append(
+ ("LPAREN" if char == "(" else "RPAREN", char)
+ )
+ position += 1
+ continue
+
+ if char == '"':
+ end = query.find('"', position + 1)
+
+ if end == -1:
+ raise BooleanQueryError("Guillemet fermant manquant.")
+
+ tokens.append(("TERM", query[position + 1:end]))
+ position = end + 1
+ continue
+
+ if char == "-" and (
+ position == 0 or query[position - 1].isspace()
+ ):
+ tokens.append(("NOT", "NOT"))
+ position += 1
+ continue
+
+ end = position
+
+ while (
+ end < len(query)
+ and not query[end].isspace()
+ and query[end] not in '()"'
+ ):
+ end += 1
+
+ value = query[position:end]
+ upper = value.upper()
+
+ token_type = (
+ upper
+ if upper in {"AND", "OR", "NOT"}
+ else "TERM"
+ )
+
+ tokens.append((token_type, value))
+ position = end
+
+ tokens.append(("EOF", ""))
+
+ return tokens
+
+
+class BooleanParser:
+ def __init__(self, tokens: list[tuple[str, str]]):
+ self.tokens = tokens
+ self.position = 0
+
+ def peek(self) -> str:
+ return self.tokens[self.position][0]
+
+ def consume(
+ self,
+ expected: str | None = None,
+ ) -> tuple[str, str]:
+ token = self.tokens[self.position]
+
+ if expected and token[0] != expected:
+ raise BooleanQueryError(
+ f"Attendu : {expected}. Trouvé : {token[1]}."
+ )
+
+ self.position += 1
+
+ return token
+
+ def parse(self):
+ node = self.parse_or()
+
+ if self.peek() != "EOF":
+ raise BooleanQueryError("Requête booléenne mal formée.")
+
+ return node
+
+ def parse_or(self):
+ node = self.parse_and()
+
+ while self.peek() == "OR":
+ self.consume("OR")
+ node = ("OR", node, self.parse_and())
+
+ return node
+
+ def parse_and(self):
+ node = self.parse_not()
+
+ while self.peek() not in {"OR", "RPAREN", "EOF"}:
+ if self.peek() == "AND":
+ self.consume("AND")
+
+ node = ("AND", node, self.parse_not())
+
+ return node
+
+ def parse_not(self):
+ if self.peek() == "NOT":
+ self.consume("NOT")
+ return ("NOT", self.parse_not())
+
+ if self.peek() == "LPAREN":
+ self.consume("LPAREN")
+ node = self.parse_or()
+ self.consume("RPAREN")
+ return node
+
+ if self.peek() == "TERM":
+ return ("TERM", self.consume("TERM")[1])
+
+ raise BooleanQueryError("Terme ou parenthèse attendu.")
+
 
 def evaluate_ast(node, text: str) -> bool:
-    if node is None: return True
-    kind = node[0]
-    if kind == 'TERM': return bool(re.search(re.escape(node[1]), text, re.IGNORECASE))
-    if kind == 'PHRASE': return bool(re.search(re.escape(node[1]), text, re.IGNORECASE))
-    if kind == 'AND': return evaluate_ast(node[1], text) and evaluate_ast(node[2], text)
-    if kind == 'OR': return evaluate_ast(node[1], text) or evaluate_ast(node[2], text)
-    if kind == 'NOT': return not evaluate_ast(node[1], text)
-    return False
+ kind = node[0]
 
-def collect_positive_terms(node) -> list:
-    if node is None: return []
-    kind = node[0]
-    if kind in ('TERM', 'PHRASE'): return [node[1]]
-    if kind == 'AND': return collect_positive_terms(node[1]) + collect_positive_terms(node[2])
-    if kind == 'OR': return collect_positive_terms(node[1]) + collect_positive_terms(node[2])
-    if kind == 'NOT': return []
-    return []
+ if kind == "TERM":
+ return bool(
+ re.search(
+ re.escape(node[1]),
+ text,
+ re.IGNORECASE,
+ )
+ )
 
-def boolean_search_and_highlight(df: pd.DataFrame, query: str):
-    if not query.strip():
-        empty = df.copy(); empty['VerbatimHighlight'] = empty['Verbatim']; empty['MotsTrouves'] = ''
-        return empty.iloc[0:0], [], None
-    try:
-        ast = build_ast(query)
-    except BooleanQueryError as e:
-        empty = df.copy(); empty['VerbatimHighlight'] = empty['Verbatim']; empty['MotsTrouves'] = ''
-        return empty.iloc[0:0], [], str(e)
-    mask = df['Verbatim'].apply(lambda x: evaluate_ast(ast, str(x)))
-    filtered = df[mask].copy()
-    positive_terms = list(dict.fromkeys(collect_positive_terms(ast)))
-    if positive_terms:
-        pattern = '|'.join(re.escape(t) for t in positive_terms)
-        regex = re.compile(f"({pattern})", flags=re.IGNORECASE)
-        filtered['VerbatimHighlight'] = filtered['Verbatim'].apply(
-            lambda x: regex.sub(r'<mark class="industrial-highlight">\1</mark>', str(x)))
-        filtered['MotsTrouves'] = filtered['Verbatim'].apply(
-            lambda x: ", ".join(list(dict.fromkeys(m.lower() for m in regex.findall(str(x))))))
-    else:
-        filtered['VerbatimHighlight'] = filtered['Verbatim']; filtered['MotsTrouves'] = ''
-    return filtered, positive_terms, None
+ if kind == "AND":
+ return (
+ evaluate_ast(node[1], text)
+ and evaluate_ast(node[2], text)
+ )
 
-# ==========================================
-# MOTEUR 1 : ASSEMBLÉE NATIONALE (FRANCE)
-# Fix ChunkedEncodingError : download_with_resume() avec Range headers
-# Le CDN de l'AN coupe la connexion après ~12MB — on reprend là où on s'est arrêté
-# ==========================================
+ if kind == "OR":
+ return (
+ evaluate_ast(node[1], text)
+ or evaluate_ast(node[2], text)
+ )
+
+ if kind == "NOT":
+ return not evaluate_ast(node[1], text)
+
+ return False
+
+
+def positive_terms(node) -> list[str]:
+ kind = node[0]
+
+ if kind == "TERM":
+ return [node[1]]
+
+ if kind == "NOT":
+ return []
+
+ return positive_terms(node[1]) + positive_terms(node[2])
+
+
+def boolean_search_and_highlight(
+ df: pd.DataFrame,
+ query: str,
+):
+ if not query.strip():
+ return df.iloc[0:0].copy(), [], None
+
+ try:
+ ast = BooleanParser(tokenize(query)).parse()
+
+ except BooleanQueryError as error:
+ return df.iloc[0:0].copy(), [], str(error)
+
+ filtered = df[
+ df["Verbatim"].astype(str).apply(
+ lambda text: evaluate_ast(ast, text)
+ )
+ ].copy()
+
+ terms = list(dict.fromkeys(positive_terms(ast)))
+
+ if not terms:
+ filtered["VerbatimHighlight"] = filtered["Verbatim"]
+ filtered["MotsTrouves"] = ""
+
+ return filtered, terms, None
+
+ pattern = re.compile(
+ "(" + "|".join(re.escape(term) for term in terms) + ")",
+ re.IGNORECASE,
+ )
+
+ filtered["VerbatimHighlight"] = (
+ filtered["Verbatim"]
+ .astype(str)
+ .apply(
+ lambda text: pattern.sub(
+ r'<mark class="industrial-highlight">\1</mark>',
+ text,
+ )
+ )
+ )
+
+ filtered["MotsTrouves"] = (
+ filtered["Verbatim"]
+ .astype(str)
+ .apply(
+ lambda text: ", ".join(
+ dict.fromkeys(
+ match.lower()
+ for match in pattern.findall(text)
+ )
+ )
+ )
+ )
+
+ return filtered, terms, None
+
+
+# =========================================================
+# COMPTES RENDUS — ARCHIVE XML ASSEMBLÉE NATIONALE
+# =========================================================
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
-def fetch_and_index_fr(url):
-    try:
-        zip_bytes = download_with_resume(url)
-    except RuntimeError as e:
-        st.error(str(e))
-        return None, None
-    except requests.exceptions.HTTPError as e:
-        st.error(f"[FR] ERREUR HTTP {e.response.status_code} : {e}")
-        return None, None
-    except Exception as e:
-        st.error(f"[FR] ERREUR INATTENDUE : {type(e).__name__} — {e}")
-        return None, None
+def fetch_and_index_fr(url: str):
+ zip_bytes = download_with_resume(url)
 
-    catalog = {}
-    regex_file = re.compile(r"(S\d+\.N\d*\.xml|CRSANR.*\.xml)", re.IGNORECASE)
-    ns = {'an': 'http://schemas.assemblee-nationale.fr/referentiel'}
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            for filename in z.namelist():
-                if regex_file.search(filename):
-                    root = etree.fromstring(z.read(filename))
-                    date_nodes = root.xpath('//an:dateSeanceJour', namespaces=ns)
-                    if date_nodes and date_nodes[0].text:
-                        raw_date = date_nodes[0].text.strip()
-                        sort_key = parse_french_date_to_sortable(raw_date)
-                        if sort_key not in catalog: catalog[sort_key] = {"label": raw_date, "files": []}
-                        catalog[sort_key]["files"].append(filename)
-    except zipfile.BadZipFile as e:
-        st.error(f"[FR] ZIP CORROMPU (téléchargement incomplet?) : {e}")
-        return None, None
-    return zip_bytes, dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
+ catalog = {}
+ file_pattern = re.compile(
+ r"(S\d+\.N\d*\.xml|CRSANR.*\.xml)",
+ re.IGNORECASE,
+ )
 
-@st.cache_data(show_spinner=False)
-def parse_selected_dates_fr(zip_bytes, selected_dates_info):
-    ns = {'an': 'http://schemas.assemblee-nationale.fr/referentiel'}; data = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        for sort_key, info in selected_dates_info.items():
-            date_label = info['label']
-            for filename in info['files']:
-                root = etree.fromstring(z.read(filename))
-                moment = "SÉANCE"
-                titre_nodes = root.xpath('//an:ouverture/an:titre', namespaces=ns) or root.xpath('//an:titre', namespaces=ns)
-                if titre_nodes and titre_nodes[0].text:
-                    ts = titre_nodes[0].text.lower()
-                    if "première" in ts: moment = "MATIN"
-                    elif "deuxième" in ts: moment = "APRÈS-MIDI"
-                    elif "troisième" in ts: moment = "NUIT"
-                for para in root.xpath('.//an:paragraphe', namespaces=ns):
-                    point_node = para.xpath('ancestor::an:point[1]/an:texte', namespaces=ns)
-                    sujet = "".join(point_node[0].itertext()).strip() if point_node else "Sujet non défini"
-                    rubrique_node = para.xpath('ancestor::an:point[1]//an:rubrique', namespaces=ns)
-                    sequence = "".join(rubrique_node[0].itertext()).strip() if rubrique_node else "DÉBAT GÉNÉRAL"
-                    orateur_node = para.xpath('.//an:orateurs/an:orateur/an:nom', namespaces=ns)
-                    nom_orateur = orateur_node[0].text.strip() if orateur_node and orateur_node[0].text else "Assemblée"
-                    qualite_node = para.xpath('.//an:orateurs/an:orateur/an:qualite', namespaces=ns)
-                    qualite = qualite_node[0].text.strip() if qualite_node and qualite_node[0].text else "DÉPUTÉ.E"
-                    texte_node = para.xpath('.//an:texte', namespaces=ns)
-                    if not texte_node: continue
-                    verbatim = "".join(texte_node[0].itertext()).strip()
-                    if not verbatim: continue
-                    italiques = para.xpath('.//an:texte//an:italique', namespaces=ns)
-                    reactions = " | ".join([it.text.strip() for it in italiques if it.text and it.text.strip()])
-                    data.append({"DateSortKey": sort_key, "DateLabel": date_label, "Moment": moment.upper(),
-                        "SujetDebat": sujet.upper(), "Sequence": sequence.upper(),
-                        "NomOrateur": nom_orateur.upper(), "Qualite": qualite.upper(),
-                        "Verbatim": verbatim, "Reactions": reactions})
-    return pd.DataFrame(data)
+ namespace = {
+ "an": "http://schemas.assemblee-nationale.fr/referentiel"
+ }
 
-# ==========================================
-# MOTEUR 2 : PARLEMENT EUROPÉEN (UE)
-# ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_and_index_eu():
-    try:
-        url = "https://data.europarl.europa.eu/api/v2/plenary-session-documents"
-        params = {"work_type": "def/ep-document-types/CRE_PLENARY", "limit": 1000}
-        response = requests.get(url, params=params, headers={**BROWSER_HEADERS, "Accept": "application/ld+json"}, timeout=30)
-        response.raise_for_status(); data = response.json().get("data", [])
-    except Exception as e:
-        st.error(f"[UE] ERREUR : {type(e).__name__} — {e}")
-        return None, None
-    catalog = {}
-    for doc in data:
-        doc_id = doc.get("identifier", "")
-        if not doc_id or not doc_id.startswith("CRE-"): continue
-        parts = doc_id.split("-")
-        if len(parts) >= 5:
-            try:
-                year, month, day = parts[2], parts[3], parts[4]
-                sort_key = f"{year}-{month}-{day}"; date_label = f"{day}/{month}/{year}"
-                if sort_key not in catalog: catalog[sort_key] = {"label": date_label, "files": [doc_id]}
-                else: catalog[sort_key]["files"].append(doc_id)
-            except Exception: continue
-    return b"eu_placeholder", dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
+ with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+ for filename in archive.namelist():
+ if not file_pattern.search(filename):
+ continue
+
+ root = etree.fromstring(archive.read(filename))
+
+ date_nodes = root.xpath(
+ "//an:dateSeanceJour",
+ namespaces=namespace,
+ )
+
+ if not date_nodes or not date_nodes[0].text:
+ continue
+
+ label = date_nodes[0].text.strip()
+ sort_key = parse_french_date_to_sortable(label)
+
+ catalog.setdefault(
+ sort_key,
+ {
+ "label": label,
+ "files": [],
+ },
+ )["files"].append(filename)
+
+ return zip_bytes, dict(sorted(catalog.items(), reverse=True))
+
 
 @st.cache_data(show_spinner=False)
-def parse_selected_dates_eu(dummy, selected_dates_info):
-    data = []
-    for sort_key, info in selected_dates_info.items():
-        date_label = info['label']
-        for doc_id in info['files']:
-            xml_url = f"https://www.europarl.europa.eu/doceo/document/{doc_id}_FR.xml"
-            try:
-                resp = requests.get(xml_url, headers=BROWSER_HEADERS, timeout=30)
-                if resp.status_code != 200: continue
-                root = etree.fromstring(resp.content)
-            except Exception: continue
-            for intervention in root.xpath('//INTERVENTION'):
-                orateur_node = intervention.xpath('.//ORATEUR')
-                if orateur_node:
-                    nom = orateur_node[0].attrib.get('LIB', 'INCONNU').replace(' | ', ' ').upper()
-                    groupe = orateur_node[0].attrib.get('PP', 'GROUPE N/A').upper()
-                else:
-                    nom = "ASSEMBLÉE"; groupe = "PLÉNIÈRE"
-                paras = intervention.xpath('.//PARA')
-                verbatim = " ".join(["".join(p.itertext()).strip() for p in paras]).strip()
-                if not verbatim: continue
-                chapter_title = intervention.xpath('ancestor::CHAPTER/TITLE/text()')
-                sujet = chapter_title[0].strip().upper() if chapter_title else "DÉBAT DE PLÉNIÈRE"
-                agenda_point = intervention.xpath('ancestor::AGENDA-POINT/@number')
-                sequence = f"POINT {agenda_point[0]}" if agenda_point else "N/A"
-                italiques = intervention.xpath('.//I | .//i')
-                reactions = " | ".join(["".join(it.itertext()).strip() for it in italiques if "".join(it.itertext()).strip()])
-                data.append({"DateSortKey": sort_key, "DateLabel": date_label, "Moment": "PLÉNIÈRE",
-                    "SujetDebat": sujet, "Sequence": sequence, "NomOrateur": nom,
-                    "Qualite": groupe, "Verbatim": verbatim, "Reactions": reactions})
-    return pd.DataFrame(data)
+def parse_selected_dates_fr(
+ zip_bytes: bytes,
+ selected_dates_info: dict,
+) -> pd.DataFrame:
+ namespace = {
+ "an": "http://schemas.assemblee-nationale.fr/referentiel"
+ }
 
-# ==========================================
-# MOTEUR 3 : CONGRÈS AMÉRICAIN (US)
-# ==========================================
-@st.cache_data(ttl=12 * 3600, show_spinner=False)
-def fetch_and_index_us():
-    api_key = get_secret_key("CONGRESS_API_KEY", "DEMO_KEY")
-    url = "https://api.congress.gov/v3/daily-congressional-record"
-    params = {"api_key": api_key, "limit": 20, "format": "json"}
-    try:
-        response = requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=30)
-        response.raise_for_status(); issues = response.json().get("dailyCongressionalRecord", [])
-    except Exception as e:
-        st.error(f"[US] ERREUR : {type(e).__name__} — {e}")
-        return None, None
-    catalog = {}
-    for issue in issues:
-        date_raw = issue.get("issueDate", "")[:10]
-        if not date_raw: continue
-        vol = str(issue.get("volumeNumber", "")); num = str(issue.get("issueNumber", ""))
-        parts = date_raw.split("-")
-        date_label = f"{parts[2]}/{parts[1]}/{parts[0]}" if len(parts) == 3 else date_raw
-        if date_raw not in catalog:
-            catalog[date_raw] = {"label": f"{date_label} (Vol.{vol} No.{num})", "files": [f"{vol}/{num}"]}
-        else: catalog[date_raw]["files"].append(f"{vol}/{num}")
-    return b"us_placeholder", dict(sorted(catalog.items(), key=lambda item: item[0], reverse=True))
+ rows = []
 
-@st.cache_data(show_spinner=False)
-def parse_selected_dates_us(dummy, selected_dates_info):
-    api_key = get_secret_key("CONGRESS_API_KEY", "DEMO_KEY"); data = []
-    for sort_key, info in selected_dates_info.items():
-        date_label = info['label'].split(" ")[0]
-        for file_id in info['files']:
-            vol, num = file_id.split('/')
-            detail_url = f"https://api.congress.gov/v3/daily-congressional-record/{vol}/{num}"
-            try:
-                resp = requests.get(detail_url, params={"api_key": api_key, "format": "json"}, headers=BROWSER_HEADERS, timeout=30)
-                if resp.status_code != 200: continue
-                sections = resp.json().get('issue', {}).get('fullIssue', {}).get('sections', [])
-            except Exception: continue
-            for section in sections:
-                chamber = section.get('name', 'UNKNOWN')
-                if chamber not in ['Senate Section', 'House Section', 'Extensions of Remarks Section']:
-                    continue
-                for text_item in section.get('text', []):
-                    if text_item.get('type') == 'Formatted Text':
-                        try:
-                            time.sleep(0.5)
-                            htm_resp = requests.get(text_item['url'], headers=BROWSER_HEADERS, timeout=30)
-                            if htm_resp.status_code != 200: continue
-                            soup = BeautifulSoup(htm_resp.content, 'html.parser')
-                            full_text = soup.get_text(separator="\n")
-                            blocks = re.split(r'\n(?=\s{2,}(?:Mr\.|Ms\.|Mrs\.|The SPEAKER|The PRESIDENT|The CHAIR))', full_text)
-                            for block in blocks:
-                                block = block.strip()
-                                if len(block) < 30: continue
-                                speaker_match = re.match(
-                                    r'((?:Mr\.|Ms\.|Mrs\.|The\s[A-Z][A-Z\s]+)[\s]+[A-Z][A-Za-z\s\.\-\']+?)[\.s]*\n?(.*)',
-                                    block, re.DOTALL
-                                )
-                                if speaker_match:
-                                    nom_orateur = speaker_match.group(1).strip().upper()
-                                    verbatim = speaker_match.group(2).strip()
-                                else:
-                                    nom_orateur = "CONGRESSIONAL RECORD"
-                                    verbatim = block
-                                if not verbatim or len(verbatim) < 20: continue
-                                data.append({"DateSortKey": sort_key, "DateLabel": date_label,
-                                    "Moment": chamber.upper(),
-                                    "SujetDebat": f"{chamber.upper()} — {sort_key}",
-                                    "Sequence": f"VOL.{vol} NO.{num}", "NomOrateur": nom_orateur,
-                                    "Qualite": chamber.replace(" Section", "").upper(),
-                                    "Verbatim": verbatim, "Reactions": ""})
-                        except Exception: continue
-    return pd.DataFrame(data)
+ with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+ for sort_key, info in selected_dates_info.items():
+ for filename in info["files"]:
+ root = etree.fromstring(archive.read(filename))
 
-# ==========================================
-# EXPORT HTML
-# ==========================================
-def generate_html_export(df, theme, institution, query=""):
-    bg_color = "#F4F4F0" if theme == "LIGHT" else "#000000"
-    text_color = "#1A1A1A" if theme == "LIGHT" else "#FFFFFF"
-    border_color = "#D2D2D2" if theme == "LIGHT" else "#333333"
-    dates_header = ", ".join(df['DateLabel'].unique())
-    if "UE" in institution: source_label = "PARLEMENT EUROPÉEN"
-    elif "US" in institution: source_label = "CONGRÈS AMÉRICAIN"
-    else: source_label = "ASSEMBLÉE NATIONALE"
-    query_label = f" // REQUÊTE: {query.upper()}" if query else ""
-    html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700&family=Space+Mono&display=swap');
-    body {{ font-family: 'Space Grotesk', sans-serif; background: {bg_color}; color: {text_color}; padding: 40px; max-width: 900px; margin: 0 auto; }}
-    h1 {{ font-family: 'Space Mono', monospace; font-size: 14px; color: #D71921; text-transform: uppercase; letter-spacing: 2px; border-bottom: 1px solid {border_color}; padding-bottom: 20px; }}
-    .item {{ border: 1px solid {border_color}; padding: 24px; margin-bottom: 20px; }}
-    .orateur {{ font-family: 'Space Mono', monospace; color: #D71921; font-weight: bold; margin-bottom: 4px; font-size: 14px; }}
-    .metadata {{ font-family: 'Space Mono', monospace; color: #888; font-size: 10px; margin-bottom: 16px; text-transform: uppercase; border-bottom: 1px dashed {border_color}; padding-bottom: 12px; }}
-    .verbatim {{ font-size: 16px; line-height: 1.6; text-align: justify; }}
-    mark {{ background: transparent; color: #D71921; border-bottom: 2px solid #D71921; font-weight: bold; padding: 0 2px; }}
-    .reactions {{ font-family: 'Space Mono', monospace; color: #888; font-size: 10px; margin-top: 20px; }}
-    </style></head><body>
-    <h1>GIARDINI EXPORT // {source_label} // {dates_header}{query_label} // {len(df)} MENTIONS</h1>"""
-    for _, row in df.iterrows():
-        html += f"""<div class="item">
-            <div class="orateur">{row['NomOrateur']} [{row['Qualite']}]</div>
-            <div class="metadata">DATE: {row['DateLabel']} (SÉANCE : {row['Moment']}) <br> SUJET: {row['SujetDebat']} <br> SÉQUENCE: {row['Sequence']}</div>
-            <div class="verbatim">{row['VerbatimHighlight']}</div>"""
-        if row['Reactions']: html += f'<div class="reactions">RX: {row["Reactions"]}</div>'
-        html += "</div>"
-    html += "</body></html>"
-    return html
+ title_nodes = root.xpath(
+ "//an:ouverture/an:titre",
+ namespaces=namespace,
+ )
 
-# ==========================================
-# APPLICATION PRINCIPALE (MAIN)
-# ==========================================
-def main():
-    if 'ui_theme' not in st.session_state: st.session_state.ui_theme = "DARK"
-    inject_custom_css(st.session_state.ui_theme)
+ title = (
+ clean_text("".join(title_nodes[0].itertext()))
+ if title_nodes
+ else ""
+ )
 
-    st.markdown('<div class="hero-title">GIARDINI</div>', unsafe_allow_html=True)
-    st.markdown('<span class="hero-subtitle">Veille des débats parlementaires en France, en UE et aux US</span>', unsafe_allow_html=True)
+ lower_title = title.lower()
 
-    st.sidebar.markdown('<div class="tertiary-text red-accent">[ PARAMÈTRES UI ]</div>', unsafe_allow_html=True)
-    theme_choice = st.sidebar.radio("THÈME", ["DARK", "LIGHT"], index=0 if st.session_state.ui_theme == "DARK" else 1, horizontal=True)
-    if theme_choice != st.session_state.ui_theme:
-        st.session_state.ui_theme = theme_choice; st.rerun()
+ if "première" in lower_title:
+ moment = "MATIN"
+ elif "deuxième" in lower_title:
+ moment = "APRÈS-MIDI"
+ elif "troisième" in lower_title:
+ moment = "NUIT"
+ else:
+ moment = "SÉANCE"
 
-    st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ SOURCE DES DONNÉES ]</div>', unsafe_allow_html=True)
-    institution = st.sidebar.radio("INSTITUTION", ["ASSEMBLÉE NATIONALE (FR)", "PARLEMENT EUROPÉEN (UE)", "CONGRÈS AMÉRICAIN (US)"])
+ for paragraph in root.xpath(
+ ".//an:paragraphe",
+ namespaces=namespace,
+ ):
+ text_nodes = paragraph.xpath(
+ ".//an:texte",
+ namespaces=namespace,
+ )
 
-    if "FR" in institution:
-        spinner_msg = "SYNCHRONISATION (FR)... [ REPRISE AUTOMATIQUE SI COUPURE RÉSEAU ]"
-    elif "UE" in institution:
-        spinner_msg = "SYNCHRONISATION (UE)..."
-    else:
-        spinner_msg = "SYNCHRONISATION (US)..."
+ if not text_nodes:
+ continue
 
-    with st.spinner(spinner_msg):
-        if "FR" in institution:
-            url = "https://data.assemblee-nationale.fr/static/openData/repository/17/vp/syceronbrut/syseron.xml.zip"
-            source_bytes, catalog = fetch_and_index_fr(url)
-        elif "UE" in institution:
-            source_bytes, catalog = fetch_and_index_eu()
-        else:
-            source_bytes, catalog = fetch_and_index_us()
+ verbatim = clean_text(
+ "".join(text_nodes[0].itertext())
+ )
 
-    if not source_bytes or not catalog:
-        st.markdown('<div class="tertiary-text red-accent">ERROR: SOURCE DE DONNÉES INACCESSIBLE. VOIR DÉTAILS CI-DESSUS.</div>', unsafe_allow_html=True)
-        st.stop()
+ if not verbatim:
+ continue
 
-    st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ DATES DES SÉANCES ]</div>', unsafe_allow_html=True)
-    selected_date_keys = st.sidebar.multiselect(
-        "DATES", options=list(catalog.keys()),
-        default=[list(catalog.keys())[0]] if catalog else [],
-        format_func=lambda x: catalog[x]['label'].upper()
-    )
-    if not selected_date_keys:
-        st.markdown('<div class="tertiary-text red-accent">SYS.HALT: VEUILLEZ SÉLECTIONNER AU MOINS UNE DATE.</div>', unsafe_allow_html=True)
-        st.stop()
+ point = paragraph.xpath(
+ "ancestor::an:point[1]",
+ namespaces=namespace,
+ )
 
-    st.sidebar.markdown('<br><div class="tertiary-text red-accent">[ MOTEUR DE RECHERCHE BOOLÉEN ]</div>', unsafe_allow_html=True)
-    bool_query = st.sidebar.text_input(
-        "REQUÊTE",
-        placeholder="EX: MACRON AND (NUCLÉAIRE OR ÉNERGIE) NOT GUERRE"
-    )
-    st.sidebar.markdown(
-        "<div class='bool-help'>"
-        "Op&eacute;rateurs support&eacute;s :<br>"
-        "&middot; <b>AND</b> &nbsp;&mdash; les deux termes<br>"
-        "&middot; <b>OR</b> &nbsp;&nbsp;&mdash; l&#39;un ou l&#39;autre<br>"
-        "&middot; <b>NOT</b> ou <b>-</b> &mdash; exclure un terme<br>"
-        "&middot; <b>(  )</b> &nbsp;&mdash; groupement<br>"
-        "&middot; <b>&quot;phrase&quot;</b> &mdash; expression exacte<br>"
-        "&middot; Sans op&eacute;rateur : AND implicite"
-        "</div>",
-        unsafe_allow_html=True
-    )
+ subject_nodes = (
+ point[0].xpath(
+ "./an:texte",
+ namespaces=namespace,
+ )
+ if point
+ else []
+ )
 
-    selected_dates_info = {k: catalog[k] for k in selected_date_keys}
-    with st.spinner("PARSING DES DONNÉES..."):
-        if "FR" in institution: df = parse_selected_dates_fr(source_bytes, selected_dates_info)
-        elif "UE" in institution: df = parse_selected_dates_eu(source_bytes, selected_dates_info)
-        else: df = parse_selected_dates_us(source_bytes, selected_dates_info)
+ sequence_nodes = (
+ point[0].xpath(
+ ".//an:rubrique",
+ namespaces=namespace,
+ )
+ if point
+ else []
+ )
 
-    st.markdown(f'<div class="tertiary-text">SYS.STATUS: {len(selected_date_keys)} DATES EN MÉMOIRE | {len(df)} ENTRÉES PARSÉES.</div><br>', unsafe_allow_html=True)
+ speaker_nodes = paragraph.xpath(
+ ".//an:orateurs/an:orateur/an:nom",
+ namespaces=namespace,
+ )
 
-    if df.empty:
-        st.markdown('<div class="tertiary-text red-accent">NULL: AUCUNE DONNÉE DISPONIBLE POUR CETTE SÉLECTION.</div>', unsafe_allow_html=True)
-        st.stop()
+ quality_nodes = paragraph.xpath(
+ ".//an:orateurs/an:orateur/an:qualite",
+ namespaces=namespace,
+ )
 
-    filtered_df, search_terms, bool_error = boolean_search_and_highlight(df, bool_query)
+ italic_nodes = paragraph.xpath(
+ ".//an:texte//an:italique",
+ namespaces=namespace,
+ )
 
-    if bool_error:
-        st.sidebar.markdown(
-            f"<div class='bool-error'>&#9888; ERREUR SYNTAXE: {bool_error}</div>",
-            unsafe_allow_html=True
-        )
+ rows.append(
+ {
+ "DateSortKey": sort_key,
+ "DateLabel": info["label"],
+ "Moment": moment,
+ "SujetDebat": (
+ clean_text(
+ "".join(
+ subject_nodes[0].itertext()
+ )
+ ).upper()
+ if subject_nodes
+ else "SUJET NON DÉFINI"
+ ),
+ "Sequence": (
+ clean_text(
+ "".join(
+ sequence_nodes[0].itertext()
+ )
+ ).upper()
+ if sequence_nodes
+ else "DÉBAT GÉNÉRAL"
+ ),
+ "NomOrateur": (
+ clean_text(
+ speaker_nodes[0].text
+ ).upper()
+ if speaker_nodes
+ and speaker_nodes[0].text
+ else "ASSEMBLÉE"
+ ),
+ "Qualite": (
+ clean_text(
+ quality_nodes[0].text
+ ).upper()
+ if quality_nodes
+ and quality_nodes[0].text
+ else "DÉPUTÉ.E"
+ ),
+ "Verbatim": verbatim,
+ "Reactions": " | ".join(
+ clean_text(node.text)
+ for node in italic_nodes
+ if node.text
+ ),
+ }
+ )
 
-    selected_indices = [
-        idx for idx in filtered_df.index
-        if st.session_state.get(f"chk_{filtered_df.loc[idx, 'DateSortKey']}_{idx}", False)
-    ]
+ return pd.DataFrame(rows)
 
-    col_data, col_meta = st.columns([3, 1])
 
-    with col_meta:
-        st.markdown('<div class="tertiary-text">MÉTRIQUES</div>', unsafe_allow_html=True)
-        st.markdown(f'<div style="font-family: Doto, sans-serif; font-size: 48px; line-height: 1;">{len(filtered_df)}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="tertiary-text">OCCURRENCES TROUVÉES</div><br>', unsafe_allow_html=True)
-        if len(filtered_df) > 0 and len(search_terms) > 0:
-            st.markdown('<br><div class="tertiary-text">[ ÉVOLUTION TEMPORELLE ]</div>', unsafe_allow_html=True)
-            chart_data = filtered_df.groupby('DateSortKey').size().reset_index(name='Mentions')
-            chart_data['DateSortKey'] = pd.to_datetime(chart_data['DateSortKey'])
-            chart_data = chart_data.set_index('DateSortKey')
-            st.line_chart(data=chart_data, y="Mentions", color="#D71921", height=250)
-        if search_terms and len(selected_indices) > 0:
-            st.markdown('<div class="tertiary-text">[ EXPORT SÉLECTIF ]</div><br>', unsafe_allow_html=True)
-            df_to_export = filtered_df.loc[selected_indices]
-            html_export = generate_html_export(df_to_export, st.session_state.ui_theme, institution, bool_query)
-            suffix = "US" if "US" in institution else ("UE" if "UE" in institution else "FR")
-            filename = f"giardini_export_{suffix}_{len(selected_date_keys)}DATES.html"
-            st.download_button("EXPORTER SÉLECTION (HTML)", data=html_export, file_name=filename, mime="text/html", type="primary")
+# =========================================================
+# AGENDA À VENIR — ASSEMBLÉE NATIONALE
+# =========================================================
+def classify_agenda_event(text: str) -> str:
+ lower = text.lower()
 
-    with col_data:
-        if not bool_query.strip():
-            st.markdown('<div class="tertiary-text">WAITING FOR INPUT: VEUILLEZ SAISIR UNE REQUÊTE DANS LE PANNEAU DE CONTRÔLE.</div>', unsafe_allow_html=True)
-        elif bool_error:
-            st.markdown(f"<div class='tertiary-text red-accent'>ERREUR DE SYNTAXE: {bool_error}</div>", unsafe_allow_html=True)
-        elif filtered_df.empty:
-            st.markdown('<div class="tertiary-text red-accent">NULL: AUCUNE CORRESPONDANCE TROUVÉE.</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="tertiary-text">RÉSULTATS (Cochez pour exporter)</div><br>', unsafe_allow_html=True)
-            for idx, row in filtered_df.iterrows():
-                expander_title = f"{row['DateLabel']} | {row['NomOrateur']} ({row['Qualite']}) | {str(row['Sequence'])[:40]}..."
-                with st.expander(expander_title, expanded=False):
-                    chk_key = f"chk_{row['DateSortKey']}_{idx}"
-                    st.checkbox("INCLURE DANS L'EXPORT", key=chk_key)
-                    st.markdown("---")
-                    st.markdown(
-                        f"<div class='tertiary-text' style='line-height: 1.8;'>"
-                        f"DATE &nbsp;&nbsp;&nbsp;&nbsp;: {row['DateLabel']} (SÉANCE : {row['Moment']})<br>"
-                        f"RÔLE &nbsp;&nbsp;&nbsp;&nbsp;: <span class='red-accent'>{row['Qualite']}</span><br>"
-                        f"SUJET &nbsp;&nbsp;&nbsp;: {row['SujetDebat']}<br>"
-                        f"SÉQUENCE: {row['Sequence']}<br>"
-                        f"DÉTECTION: <span class='red-accent'>{row['MotsTrouves'].upper()}</span>"
-                        f"</div><br>",
-                        unsafe_allow_html=True
-                    )
-                    st.markdown(f"<div style='line-height: 1.6; text-align: justify;'>{row['VerbatimHighlight']}</div>", unsafe_allow_html=True)
-                    if row['Reactions']:
-                        st.markdown(f"<br><div class='tertiary-text'>RX: {row['Reactions']}</div>", unsafe_allow_html=True)
+ if "séance publique" in lower:
+ return "SÉANCE PUBLIQUE"
 
-if __name__ == '__main__':
-    main()
+ if "conférence des présidents" in lower:
+ return "CONFÉRENCE DES PRÉSIDENTS"
+
+ if "commission" in lower:
+ return "COMMISSION"
+
+ if "réunion" in lower:
+ return "RÉUNION"
+
+ return "AGENDA"
+
+
+def extract_instance(text: str) -> str:
+ lower = text.lower()
+
+ instances = {
+ "commission des finances": "COMMISSION DES FINANCES",
+ "commission des affaires économiques": (
+ "COMMISSION DES AFFAIRES ÉCONOMIQUES"
+ ),
+ "commission des affaires sociales": (
+ "COMMISSION DES AFFAIRES SOCIALES"
+ ),
+ "commission des lois": "COMMISSION DES LOIS",
+ "commission du développement durable": (
+ "COMMISSION DU DÉVELOPPEMENT DURABLE"
+ ),
+ "conférence des présidents": (
+ "CONFÉRENCE DES PRÉSIDENTS"
+ ),
+ }
+
+ for keyword, label in instances.items():
+ if keyword in lower:
+ return label
+
+ return "ASSEMBLÉE NATIONALE"
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def fetch_agenda_fr(
+ lookahead_days: int = 90,
+) -> pd.DataFrame:
+ """
+ Récupère les séances et réunions futures depuis la page Agenda.
+ Le parser est volontairement tolérant car le HTML de l'AN peut évoluer.
+ """
+ soup = request_html(AN_AGENDA_URL)
+
+ today = date.today()
+ limit = today + timedelta(days=lookahead_days)
+
+ rows = []
+ seen = set()
+
+ candidates = soup.select(
+ "article, li, tr, .agenda-item, .event, .item, section"
+ )
+
+ for candidate in candidates:
+ text = clean_text(
+ candidate.get_text(" ", strip=True)
+ )
+
+ event_date = extract_french_date(text)
+
+ if not event_date:
+ continue
+
+ if not today <= event_date <= limit:
+ continue
+
+ if not any(
+ keyword in text.lower()
+ for keyword in (
+ "séance",
+ "réunion",
+ "commission",
+ "conférence des présidents",
+ )
+ ):
+ continue
+
+ title_node = candidate.select_one(
+ "h1, h2, h3, h4, .title, a"
+ )
+
+ title = (
+ clean_text(title_node.get_text(" ", strip=True))
+ if title_node
+ else text[:240]
+ )
+
+ link_node = candidate.select_one("a[href]")
+
+ source_url = (
+ urljoin(AN_AGENDA_URL, link_node["href"])
+ if link_node
+ else AN_AGENDA_URL
+ )
+
+ event_id = (
+ f"{event_date.isoformat()}|{source_url}|{title}"
+ ).lower()
+
+ if event_id in seen:
+ continue
+
+ seen.add(event_id)
+
+ rows.append(
+ {
+ "EventId": event_id,
+ "Date": event_date.isoformat(),
+ "Heure": extract_time(text),
+ "Type": classify_agenda_event(text),
+ "Instance": extract_instance(text),
+ "Titre": title,
+ "Statut": "PRÉVUE",
+ "SourceUrl": source_url,
+ "SourceUpdatedAt": datetime.utcnow().isoformat(
+ timespec="seconds"
+ ),
+ }
+ )
+
+ agenda = pd.DataFrame(rows, columns=AGENDA_COLUMNS)
+
+ if agenda.empty:
+ return agenda
+
+ return (
+ agenda
+ .drop_duplicates("EventId")
+ .sort_values(["Date", "Heure"])
+ .reset_index(drop=True)
+ )
+
+
+# =========================================================
+# DOSSIER LÉGISLATIF — PLF 2027
+# =========================================================
+def classify_plf_step(text: str) -> str:
+ lower = text.lower()
+
+ mapping = [
+ ("conseil constitutionnel", "CONSEIL CONSTITUTIONNEL"),
+ ("commission mixte paritaire", "CMP"),
+ ("promulgation", "PROMULGATION"),
+ ("séance publique", "SÉANCE PUBLIQUE"),
+ ("commission des finances", "COMMISSION DES FINANCES"),
+ ("amendement", "AMENDEMENTS"),
+ ("rapport", "RAPPORT PUBLIÉ"),
+ ("sénat", "NAVETTE AU SÉNAT"),
+ ("dépôt", "DÉPÔT"),
+ ("première lecture", "PREMIÈRE LECTURE"),
+ ]
+
+ for keyword, label in mapping:
+ if keyword in lower:
+ return label
+
+ return "ÉTAPE À QUALIFIER"
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def fetch_plf_2027_events(
+ dossier_url: str,
+) -> pd.DataFrame:
+ if not dossier_url.strip():
+ return pd.DataFrame(columns=PLF_COLUMNS)
+
+ soup = request_html(dossier_url)
+
+ full_text = clean_text(
+ soup.get_text(" ", strip=True)
+ ).lower()
+
+ if "loi de finances" not in full_text and "plf 2027" not in full_text:
+ raise ValueError(
+ "Cette URL ne semble pas correspondre "
+ "à un dossier de loi de finances."
+ )
+
+ rows = []
+ seen = set()
+
+ candidates = soup.select(
+ "article, li, tr, .timeline-item, .etape, .step, section"
+ )
+
+ for candidate in candidates:
+ text = clean_text(
+ candidate.get_text(" ", strip=True)
+ )
+
+ if not text:
+ continue
+
+ lower = text.lower()
+
+ keywords = (
+ "dépôt",
+ "commission",
+ "rapport",
+ "amendement",
+ "séance",
+ "sénat",
+ "mixte paritaire",
+ "constitutionnel",
+ "promulgation",
+ )
+
+ if not any(keyword in lower for keyword in keywords):
+ continue
+
+ event_date = extract_french_date(text)
+
+ title_node = candidate.select_one(
+ "h1, h2, h3, h4, .title, a"
+ )
+
+ title = (
+ clean_text(title_node.get_text(" ", strip=True))
+ if title_node
+ else text[:260]
+ )
+
+ link_node = candidate.select_one("a[href]")
+
+ source_url = (
+ urljoin(dossier_url, link_node["href"])
+ if link_node
+ else dossier_url
+ )
+
+ step = classify_plf_step(text)
+
+ event_id = (
+ f"{event_date.isoformat() if event_date else 'undated'}"
+ f"|{step}|{source_url}"
+ ).lower()
+
+ if event_id in seen:
+ continue
+
+ seen.add(event_id)
+
+ rows.append(
+ {
+ "EventId": event_id,
+ "Date": (
+ event_date.isoformat()
+ if event_date
+ else ""
+ ),
+ "Etape": step,
+ "Instance": extract_instance(text),
+ "Titre": title,
+ "Statut": "PUBLIÉ",
+ "SourceUrl": source_url,
+ "SourceUpdatedAt": datetime.utcnow().isoformat(
+ timespec="seconds"
+ ),
+ }
+ )
+
+ events = pd.DataFrame(rows, columns=PLF_COLUMNS)
+
+ if events.empty:
+ return events
+
+ return (
+ events
+ .sort_values(
+ "Date",
+ ascending=False,
+ na_position="last",
+ )
+ .reset_index(drop=True)
+ )
+
+
+# =========================================================
+# ONGLETS
+# =========================================================
+def render_agenda(agenda_df: pd.DataFrame) -> None:
+ st.subheader("Séances et réunions à venir")
+
+ st.caption(
+ "Source : agenda officiel de l’Assemblée nationale. "
+ "Les comptes rendus publiés restent dans l’onglet Débats."
+ )
+
+ if agenda_df.empty:
+ st.info(
+ "Aucun événement futur détecté dans la fenêtre choisie. "
+ "Vérifiez l’agenda officiel ou augmentez l’horizon de veille."
+ )
+ return
+
+ st.dataframe(
+ agenda_df[
+ [
+ "Date",
+ "Heure",
+ "Type",
+ "Instance",
+ "Titre",
+ "Statut",
+ "SourceUrl",
+ ]
+ ],
+ use_container_width=True,
+ hide_index=True,
+ )
+
+
+def render_plf(
+ plf_df: pd.DataFrame,
+ dossier_url: str,
+) -> None:
+ st.subheader("PLF 2027 — parcours législatif")
+
+ if not dossier_url.strip():
+ st.warning(
+ "Renseignez l’URL officielle du dossier législatif "
+ "du PLF 2027 dans la barre latérale."
+ )
+ return
+
+ if plf_df.empty:
+ st.info(
+ "Aucun jalon n’a été extrait. Vérifiez l’URL du dossier "
+ "ou le format de la page officielle."
+ )
+ return
+
+ st.dataframe(
+ plf_df[
+ [
+ "Date",
+ "Etape",
+ "Instance",
+ "Titre",
+ "Statut",
+ "SourceUrl",
+ ]
+ ],
+ use_container_width=True,
+ hide_index=True,
+ )
+
+
+def render_debates(
+ zip_bytes: bytes,
+ catalog: dict,
+) -> None:
+ st.subheader("Débats et comptes rendus publiés")
+
+ st.caption(
+ "Source : archive XML des comptes rendus de séance. "
+ "Cette source ne contient pas les séances futures."
+ )
+
+ selected_dates = st.multiselect(
+ "Dates de comptes rendus",
+ options=list(catalog.keys()),
+ default=[next(iter(catalog))] if catalog else [],
+ format_func=lambda key: catalog[key]["label"].upper(),
+ )
+
+ if not selected_dates:
+ st.info("Sélectionnez au moins une date de compte rendu.")
+ return
+
+ query = st.text_input(
+ "Requête booléenne",
+ placeholder=(
+ "Ex. MACRON AND "
+ "(NUCLÉAIRE OR ÉNERGIE) NOT GUERRE"
+ ),
+ )
+
+ st.caption(
+ 'AND, OR, NOT, -, parenthèses et "expression exacte" '
+ "sont pris en charge. Sans opérateur : AND implicite."
+ )
+
+ selected_info = {
+ key: catalog[key]
+ for key in selected_dates
+ }
+
+ with st.spinner("Parsing des comptes rendus XML..."):
+ debates_df = parse_selected_dates_fr(
+ zip_bytes,
+ selected_info,
+ )
+
+ if debates_df.empty:
+ st.warning(
+ "Aucune intervention n’a été trouvée "
+ "pour les dates sélectionnées."
+ )
+ return
+
+ filtered_df, terms, bool_error = (
+ boolean_search_and_highlight(
+ debates_df,
+ query,
+ )
+ )
+
+ st.markdown(
+ f"""
+ <div class="tertiary">
+ {len(selected_dates)} date(s) chargée(s)
+ · {len(debates_df)} intervention(s) parsée(s)
+ </div>
+ """,
+ unsafe_allow_html=True,
+ )
+
+ if bool_error:
+ st.error(f"Erreur de syntaxe : {bool_error}")
+ return
+
+ if not query.strip():
+ st.info(
+ "Saisissez une requête pour afficher "
+ "les interventions correspondantes."
+ )
+ return
+
+ if filtered_df.empty:
+ st.warning("Aucune correspondance trouvée.")
+ return
+
+ metric_col, chart_col = st.columns([1, 2])
+
+ metric_col.metric(
+ "Occurrences",
+ len(filtered_df),
+ )
+
+ if terms:
+ chart = (
+ filtered_df
+ .groupby("DateSortKey")
+ .size()
+ .rename("Mentions")
+ )
+
+ chart.index = pd.to_datetime(chart.index)
+
+ chart_col.line_chart(
+ chart,
+ color="#D71921",
+ height=180,
+ )
+
+ selected_export_indices = []
+
+ for index, row in filtered_df.iterrows():
+ label = (
+ f"{row['DateLabel']} | "
+ f"{row['NomOrateur']} | "
+ f"{str(row['Sequence'])[:55]}"
+ )
+
+ with st.expander(label):
+ include = st.checkbox(
+ "Inclure dans l’export",
+ key=f"export_{row['DateSortKey']}_{index}",
+ )
+
+ if include:
+ selected_export_indices.append(index)
+
+ st.markdown(
+ f"""
+ <div class="tertiary">
+ Date : {row['DateLabel']} · Séance : {row['Moment']}<br>
+ Rôle : <span class="accent">{row['Qualite']}</span><br>
+ Sujet : {row['SujetDebat']}<br>
+ Séquence : {row['Sequence']}<br>
+ Détections :
+ <span class="accent">
+ {row['MotsTrouves'].upper()}
+ </span>
+ </div>
+ """,
+ unsafe_allow_html=True,
+ )
+
+ st.markdown(
+ row["VerbatimHighlight"],
+ unsafe_allow_html=True,
+ )
+
+ if row["Reactions"]:
+ st.caption(
+ f"Réactions : {row['Reactions']}"
+ )
+
+ if selected_export_indices:
+ export_df = filtered_df.loc[selected_export_indices]
+
+ csv = (
+ export_df
+ .drop(
+ columns=["VerbatimHighlight"],
+ errors="ignore",
+ )
+ .to_csv(index=False)
+ .encode("utf-8-sig")
+ )
+
+ st.download_button(
+ "Exporter la sélection (CSV)",
+ data=csv,
+ file_name="giardini_comptes_rendus_selection.csv",
+ mime="text/csv",
+ )
+
+
+# =========================================================
+# APPLICATION
+# =========================================================
+def main() -> None:
+ if "ui_theme" not in st.session_state:
+ st.session_state.ui_theme = "DARK"
+
+ st.sidebar.markdown("### Paramètres")
+
+ theme = st.sidebar.radio(
+ "Thème",
+ ["DARK", "LIGHT"],
+ horizontal=True,
+ )
+
+ st.session_state.ui_theme = theme
+ inject_custom_css(theme)
+
+ st.markdown(
+ '<div class="hero-title">GIARDINI</div>',
+ unsafe_allow_html=True,
+ )
+
+ st.markdown(
+ '<span class="hero-subtitle">'
+ "Veille parlementaire — Assemblée nationale"
+ "</span>",
+ unsafe_allow_html=True,
+ )
+
+ st.sidebar.markdown("---")
+ st.sidebar.markdown("### Agenda")
+
+ lookahead_days = st.sidebar.slider(
+ "Horizon de veille",
+ min_value=14,
+ max_value=180,
+ value=90,
+ step=7,
+ )
+
+ st.sidebar.markdown("### PLF 2027")
+
+ dossier_url = st.sidebar.text_input(
+ "URL du dossier législatif officiel",
+ value=st.session_state.get(
+ "plf_2027_dossier_url",
+ "",
+ ),
+ placeholder=(
+ "https://www.assemblee-nationale.fr/"
+ "dyn/17/dossiers/..."
+ ),
+ ).strip()
+
+ st.session_state["plf_2027_dossier_url"] = dossier_url
+
+ if st.sidebar.button("Actualiser les sources"):
+ fetch_agenda_fr.clear()
+ fetch_plf_2027_events.clear()
+ fetch_and_index_fr.clear()
+ parse_selected_dates_fr.clear()
+ st.rerun()
+
+ with st.spinner("Synchronisation de l’agenda..."):
+ try:
+ agenda_df = fetch_agenda_fr(lookahead_days)
+
+ except Exception as error:
+ agenda_df = pd.DataFrame(
+ columns=AGENDA_COLUMNS
+ )
+
+ st.warning(
+ "Agenda temporairement indisponible : "
+ f"{type(error).__name__}."
+ )
+
+ with st.spinner("Chargement du dossier PLF 2027..."):
+ try:
+ plf_df = fetch_plf_2027_events(
+ dossier_url
+ )
+
+ except Exception as error:
+ plf_df = pd.DataFrame(
+ columns=PLF_COLUMNS
+ )
+
+ if dossier_url:
+ st.warning(
+ "Dossier PLF 2027 non exploitable : "
+ f"{error}"
+ )
+
+ tab_agenda, tab_debats, tab_plf = st.tabs(
+ [
+ "À venir",
+ "Débats & comptes rendus",
+ "PLF 2027",
+ ]
+ )
+
+ with tab_agenda:
+ render_agenda(agenda_df)
+
+ with tab_debats:
+ with st.spinner(
+ "Synchronisation de l’archive de comptes rendus..."
+ ):
+ try:
+ zip_bytes, catalog = fetch_and_index_fr(
+ AN_TRANSCRIPTS_URL
+ )
+
+ except Exception as error:
+ st.error(
+ "Archive de comptes rendus indisponible : "
+ f"{type(error).__name__} — {error}"
+ )
+
+ zip_bytes, catalog = None, None
+
+ if zip_bytes and catalog:
+ render_debates(zip_bytes, catalog)
+
+ with tab_plf:
+ render_plf(plf_df, dossier_url)
+
+
+if __name__ == "__main__":
+ main()
